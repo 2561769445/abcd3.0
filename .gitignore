@@ -1,0 +1,25 @@
+__pycache__/
+node_modules/
+/dist/
+release/
+*.exe
+
+# 内部运维脚本(含服务器凭据, 永不入库)
+deploy/vps_ssh*.py
+deploy/deploy_v*.py
+deploy/upgrade_nodes*.py
+deploy/verify_*.py
+
+# 本地产物/含密测试脚本
+portmux_linux*
+deploy/test_*.py
+tmp_*.json
+deploy/clock_*.sh
+deploy/diag_*.sh
+deploy/diag_*.py
+deploy/gor_dump.txt
+deploy/kill_java.sh
+
+# 3.0发布补漏(含凭据运维脚本)
+deploy/deploy_*.py
+deploy/upgrade_*.py
