@@ -154,7 +154,7 @@ func GenerateHTMLReportFooter() {
 </div>`, "\u25b8", len(gopocEvents), credBody.String())
 	}
 
-	footer := `<div class="footer"><b>ABCD Scanner v1.3.0</b> — 月落攻防实验室</div>
+	footer := `<div class="footer"><b>ABCD Scanner v3.0.0</b> — 月落攻防实验室</div>
 </body></html>
 `
 
