@@ -350,6 +350,68 @@ func delPullQueues(ctx context.Context, rdb *redis.Client, id string) {
 	rdb.Del(ctx, keys...)
 }
 
+// purgeQueueByID 整队列轮转一圈剔除指定任务描述子(保序完整一圈): 弹出非目标元素回推,
+// 回推到首个元素时停。判死/完成/转段时调用, 防僵尸描述子堆积致后续任务排队空转30s/个。
+// (v60 N7轮转语义: 原版遇首个非目标就break会漏清队头是别任务时压后面的本任务描述子)
+func purgeQueueByID(ctx context.Context, rdb *redis.Client, qkey, taskID string) {
+	var firstKept string
+	first := true
+	for {
+		raw, err := rdb.LPop(ctx, qkey).Result()
+		if err != nil {
+			return // 队列空
+		}
+		var probe cluster.Task
+		if json.Unmarshal([]byte(raw), &probe) == nil && probe.ID == taskID {
+			continue // 丢弃本任务描述子, 继续弹
+		}
+		if first {
+			firstKept = raw
+			first = false
+		} else if raw == firstKept {
+			// 转了一整圈, 队列已全扫过
+			return
+		}
+		rdb.RPush(ctx, qkey, raw)
+		if raw == firstKept {
+			return
+		}
+	}
+}
+
+// purgeNodeQueues 清理所有节点专属队列里的本任务描述子(判死/完成/转段时调用)
+func purgeNodeQueues(ctx context.Context, rdb *redis.Client, id string) {
+	all, err := rdb.HGetAll(ctx, cluster.HashNodes).Result()
+	if err != nil {
+		return
+	}
+	for nodeID := range all {
+		purgeQueueByID(ctx, rdb, cluster.QueueNodePrefix+nodeID, id)
+	}
+}
+
+// nodeQueuesHave 任一节点队列里已堆有本任务描述子(排队中) — recoverStalled重推前查重,
+// 防"每10分钟堆一份"的膨胀(2026-09-14实测32个/节点, 后续任务排队16分钟+)
+func nodeQueuesHave(ctx context.Context, rdb *redis.Client, id string) bool {
+	all, err := rdb.HGetAll(ctx, cluster.HashNodes).Result()
+	if err != nil {
+		return false
+	}
+	for nodeID := range all {
+		items, err := rdb.LRange(ctx, cluster.QueueNodePrefix+nodeID, 0, -1).Result()
+		if err != nil {
+			continue
+		}
+		for _, raw := range items {
+			var probe cluster.Task
+			if json.Unmarshal([]byte(raw), &probe) == nil && probe.ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // pullQLen 全阶段队列长度总和 — 完成判定/僵尸检测看的是"还有没有任何工作项"
 func pullQLen(ctx context.Context, rdb *redis.Client, id string) int64 {
 	n, _ := rdb.LLen(ctx, cluster.QueuePullPrefix + id).Result()
@@ -607,6 +669,10 @@ func recoverStalled(ctx context.Context, rdb *redis.Client) {
 			if anyBusy {
 				continue
 			}
+			// 描述子已在节点队列排队(尚未被领) → 不重复推, 防每10min堆一份膨胀
+			if nodeQueuesHave(ctx, rdb, id) {
+				continue
+			}
 			guard := "task:despatcher:" + id
 			ok, err := rdb.SetNX(ctx, guard, 1, 10*time.Minute).Result()
 			if err != nil || !ok {
@@ -772,7 +838,8 @@ func pullTaskDone(ctx context.Context, rdb *redis.Client, id string) {
 	}
 	db.Exec(`UPDATE tasks SET status='done', finished_at=now() WHERE id=$1`, id)
 	notifyTaskDone(id)
-	// 收尾清理: 队列/计数键
+	// 收尾清理: 队列/计数键 + 节点队列残留描述子(不删会排队空转30s/个)
+	purgeNodeQueues(ctx, rdb, id)
 	delPullQueues(ctx, rdb, id)
 	rdb.Del(ctx, cluster.PullTotalPrefix+id, cluster.PullDonePrefix+id, cluster.PullLivePrefix+id)
 	settleTask(ctx, rdb, id)
@@ -792,6 +859,7 @@ func advancePhase(ctx context.Context, rdb *redis.Client, id string, opts cluste
 				rdb.Del(ctx, k)
 				db.Exec(`UPDATE tasks SET status='done', finished_at=now() WHERE id=$1`, id)
 				notifyTaskDone(id)
+				purgeNodeQueues(ctx, rdb, id) // 误判/真判死都清残留描述子
 				delPullQueues(ctx, rdb, id)
 				rdb.Del(ctx, cluster.PullTotalPrefix+id, cluster.PullDonePrefix+id)
 				settleTask(ctx, rdb, id)
@@ -813,6 +881,7 @@ func advancePhase(ctx context.Context, rdb *redis.Client, id string, opts cluste
 		}
 		rdb.Del(ctx, cluster.PullDonePrefix+id, cluster.PullLivePrefix+id)
 		opts.ScanPhase = next
+		purgeNodeQueues(ctx, rdb, id) // 转段前清旧阶段描述子(旧键已空, 弹到只空转30s)
 		if pushPullDescriptor(ctx, rdb, id, "", "", opts) {
 			db.Exec(`UPDATE tasks SET options=$2 WHERE id=$1`, id, mustJSON(opts))
 			if logMsg != "" {

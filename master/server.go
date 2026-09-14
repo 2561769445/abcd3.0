@@ -665,31 +665,9 @@ func cleanupTask(c *gin.Context, id string) {
 	rdb.Del(c, "task:despatcher:"+id)
 }
 
-// cleanupQueueByID 整队列轮转一圈剔除任务描述子: 弹出非目标元素回推, 回推到首个元素时停(保序完整一圈)
+// cleanupQueueByID 整队列轮转一圈剔除任务描述子(核心逻辑在scheduler.go purgeQueueByID, 判死/完成/转段复用)
 func cleanupQueueByID(c *gin.Context, qkey, taskID string) {
-	var firstKept string
-	first := true
-	for {
-		raw, err := rdb.LPop(c, qkey).Result()
-		if err != nil {
-			return // 队列空
-		}
-		var probe cluster.Task
-		if json.Unmarshal([]byte(raw), &probe) == nil && probe.ID == taskID {
-			continue // 丢弃本任务描述子, 继续弹
-		}
-		if first {
-			firstKept = raw
-			first = false
-		} else if raw == firstKept {
-			// 转了一整圈, 队列已全扫过
-			return
-		}
-		rdb.RPush(c, qkey, raw)
-		if raw == firstKept {
-			return
-		}
-	}
+	purgeQueueByID(c, rdb, qkey, taskID)
 }
 
 func handleDeleteTask(c *gin.Context) {
