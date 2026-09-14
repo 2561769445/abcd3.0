@@ -192,7 +192,7 @@ func dispatchTasks(ctx context.Context, rdb *redis.Client) {
 
 		// pull模式: 工作项(目标逐条)入工作队列, 描述子推给所有在线节点认领
 		if opts.Mode == "pull" {
-			if dispatchPullTask(ctx, rdb, p.id, p.name, p.ports, opts, targets) {
+			if dispatchPullTask(ctx, rdb, p.id, p.name, p.ports, &opts, targets) {
 				db.Exec(`UPDATE tasks SET status='queued', started_at=now() WHERE id=$1`, p.id)
 				gologger.Info().Msgf("pull任务已派发: %s 工作项=%d", p.id, len(targets))
 			}
@@ -203,9 +203,11 @@ func dispatchTasks(ctx context.Context, rdb *redis.Client) {
 		// 肥瘦自动均衡; 阈值环境变量ABCD_PULL_THRESHOLD(默认2000)
 		if int64(len(targets)) > pullThreshold() {
 			opts.Mode = "pull"
-			if dispatchPullTask(ctx, rdb, p.id, p.name, p.ports, opts, targets) {
-				db.Exec(`UPDATE tasks SET status='queued', started_at=now(), options=$2 WHERE id=$1`,
-					p.id, mustJSON(opts))
+			// 传指针: dispatchPullTask内部算出的ScanPhase必须对调用者可见 —
+			// 值传递时返回后旧opts(scan_phase空)回写DB会覆盖内部回写的正确值,
+			// 判空逻辑用错队列键(无后缀 vs :ports), 派发后50秒任务被误判"无产出done"(2026-09-14事故)
+			if dispatchPullTask(ctx, rdb, p.id, p.name, p.ports, &opts, targets) {
+				db.Exec(`UPDATE tasks SET status='queued', started_at=now() WHERE id=$1`, p.id)
 				gologger.Info().Msgf("大任务自动转pull: %s 目标=%d 阈值=%d 阶段=%s",
 					p.id, len(targets), pullThreshold(), opts.ScanPhase)
 			}
@@ -244,7 +246,7 @@ func dispatchTasks(ctx context.Context, rdb *redis.Client) {
 
 // dispatchPullTask pull模式派发: 工作项RPUSH进queue:pull:{id}, 描述子(空Targets)推所有在线节点专属队列。
 // 节点领到描述子后自行BLPOP工作项, 谁空闲谁多干, 节点中途宕机不丢工作(项目回到队列)。
-func dispatchPullTask(ctx context.Context, rdb *redis.Client, id, name, ports string, opts cluster.ScanOptions, targets []string) bool {
+func dispatchPullTask(ctx context.Context, rdb *redis.Client, id, name, ports string, opts *cluster.ScanOptions, targets []string) bool {
 	// 阶段路由(未显式指定时): 测绘语法/域名→map起(测绘只拉资产, 资产批回流全员认领),
 	// IP/CIDR→ports起, 纯URL→单阶段(本身就是资产直接分批扫)
 	if opts.ScanPhase == "" {
@@ -257,7 +259,7 @@ func dispatchPullTask(ctx context.Context, rdb *redis.Client, id, name, ports st
 	qkey := cluster.QueuePullKey(id, opts.ScanPhase)
 	if n, _ := rdb.LLen(ctx, qkey).Result(); n > 0 {
 		if total, terr := rdb.Get(ctx, cluster.PullTotalPrefix+id).Int(); terr == nil && total > 0 {
-			return pushPullDescriptor(ctx, rdb, id, name, ports, opts)
+			return pushPullDescriptor(ctx, rdb, id, name, ports, *opts)
 		}
 		// total缺失=僵尸队列: 清掉走正常重灌
 		delPullQueues(ctx, rdb, id)
@@ -291,7 +293,7 @@ func dispatchPullTask(ctx context.Context, rdb *redis.Client, id, name, ports st
 	rdb.Set(ctx, cluster.PullTotalPrefix+id, len(cleaned), 0)
 	rdb.Del(ctx, cluster.PullDonePrefix+id, cluster.PullLivePrefix+id)
 	gologger.Info().Msgf("pull任务工作队列: %s 目标=%d 批大小=%d 批数=%d", id, len(cleaned), batch, len(items))
-	return pushPullDescriptor(ctx, rdb, id, name, ports, opts)
+	return pushPullDescriptor(ctx, rdb, id, name, ports, *opts)
 }
 
 // pullBatchSize pull工作项批大小(ABCD_PULL_BATCH环境变量, 默认25个目标/批)
