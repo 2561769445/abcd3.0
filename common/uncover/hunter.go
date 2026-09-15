@@ -418,6 +418,11 @@ func HunterSearch(keywords []string) ([]string, []string) {
 	var results []string
 	var ipResults []string
 	for _, keyword := range keywords {
+		// URL关键词不是测绘查询串: 发Hunter必报"字段http不支持查询"+3次重试退避,
+		// 每个脏URL耗~35秒拖垮整个map阶段(2026-09-15事故) — 直接跳过(引擎层防御, 主修在master派发分类)
+		if strings.Contains(keyword, "://") {
+			continue
+		}
 		result, ipResult := SearchHunterCore(keyword,
 			structs.GlobalConfig.HunterPageSize,
 			structs.GlobalConfig.HunterMaxPageCount)

@@ -278,21 +278,55 @@ func dispatchPullTask(ctx context.Context, rdb *redis.Client, id, name, ports st
 		db.Exec(`UPDATE tasks SET status='done', finished_at=now() WHERE id=$1`, id)
 		return false
 	}
-	items := make([]interface{}, 0, (len(cleaned)+batch-1)/batch)
-	for i := 0; i < len(cleaned); i += batch {
-		end := i + batch
-		if end > len(cleaned) {
-			end = len(cleaned)
+	// map阶段目标混有URL时(测绘导出脏数据/历史清单): URL直接预置进下一阶段ports键,
+	// 不进:map — 否则引擎把URL当查询串发Hunter("字段http不支持查询"+3次重试退避+3s令牌),
+	// 每个脏URL耗~35秒, 63批拖15小时(2026-09-15事故)
+	mapBatch, urlBatch := cleaned, []string(nil)
+	if opts.ScanPhase == "map" {
+		mapBatch = make([]string, 0, len(cleaned))
+		urlBatch = make([]string, 0)
+		for _, t := range cleaned {
+			if strings.Contains(t, "://") {
+				urlBatch = append(urlBatch, t)
+			} else {
+				mapBatch = append(mapBatch, t)
+			}
 		}
-		items = append(items, strings.Join(cleaned[i:end], "\n"))
 	}
-	if err := rdb.RPush(ctx, qkey, items...).Err(); err != nil {
-		gologger.Warning().Msgf("pull工作队列写入失败 %s: %v", id, err)
-		return false
+	items := make([]interface{}, 0, (len(mapBatch)+batch-1)/batch)
+	for i := 0; i < len(mapBatch); i += batch {
+		end := i + batch
+		if end > len(mapBatch) {
+			end = len(mapBatch)
+		}
+		items = append(items, strings.Join(mapBatch[i:end], "\n"))
 	}
-	rdb.Set(ctx, cluster.PullTotalPrefix+id, len(cleaned), 0)
+	if len(items) > 0 {
+		if err := rdb.RPush(ctx, qkey, items...).Err(); err != nil {
+			gologger.Warning().Msgf("pull工作队列写入失败 %s: %v", id, err)
+			return false
+		}
+	}
+	if len(urlBatch) > 0 {
+		uitems := make([]interface{}, 0, (len(urlBatch)+batch-1)/batch)
+		for i := 0; i < len(urlBatch); i += batch {
+			end := i + batch
+			if end > len(urlBatch) {
+				end = len(urlBatch)
+			}
+			uitems = append(uitems, strings.Join(urlBatch[i:end], "\n"))
+		}
+		if err := rdb.RPush(ctx, cluster.QueuePullKey(id, "ports"), uitems...).Err(); err != nil {
+			gologger.Warning().Msgf("pull初始URL预置ports失败 %s: %v", id, err)
+			return false
+		}
+		// 初始URL是下一阶段工作项: 与回流产物同口径累加phase2total, 转段时total重置才正确
+		rdb.IncrBy(ctx, "task:pull:phase2total:"+id, int64(len(urlBatch)))
+		rdb.Expire(ctx, "task:pull:phase2total:"+id, 24*time.Hour)
+	}
+	rdb.Set(ctx, cluster.PullTotalPrefix+id, len(mapBatch), 0)
 	rdb.Del(ctx, cluster.PullDonePrefix+id, cluster.PullLivePrefix+id)
-	gologger.Info().Msgf("pull任务工作队列: %s 目标=%d 批大小=%d 批数=%d", id, len(cleaned), batch, len(items))
+	gologger.Info().Msgf("pull任务工作队列: %s 本阶段目标=%d URL预置下一阶段=%d 批大小=%d 批数=%d", id, len(mapBatch), len(urlBatch), batch, len(items))
 	return pushPullDescriptor(ctx, rdb, id, name, ports, *opts)
 }
 
