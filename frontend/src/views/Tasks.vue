@@ -374,17 +374,41 @@ async function save() {
       await api.post('/tasks', { name: form.name || '未命名任务', targets, ports: form.ports, node_id: nids[0] || '', options: form.options })
       ElMessage.success('任务已创建, 等待调度派发')
     } else {
-      // 勾选多节点: 目标轮询均分, 每节点一个子任务并行扫
       const nameMap = {}; nodes.value.forEach(n => nameMap[n.id] = n.name)
-      const buckets = {}; nids.forEach(id => buckets[id] = [])
-      targets.forEach((t, i) => buckets[nids[i % nids.length]].push(t))
-      let k = 0
-      for (const id of nids) {
-        if (!buckets[id].length) continue
-        k++
-        await api.post('/tasks', { name: (form.name || '未命名任务') + ' [' + (nameMap[id] || id) + ']', targets: buckets[id], ports: form.ports, node_id: id, options: form.options })
+      const base = form.name || '未命名任务'
+      // v66 端口分段并行: 目标数<节点数 且 端口范围跨度≥1000时, 按端口段拆分 —
+      // 取最大的端口范围均分成N段, 每节点领一段扫全部目标(1个IP的全端口8台一起扫, 8倍提速);
+      // 其余散口/小段每台都带上; 多目标场景仍走目标轮询均分(每台拿自己的目标集, 端口完整)
+      const pstr = (form.ports || '').replace(/\s/g, '')
+      let big = null, rest = []
+      for (const seg of pstr.split(',').filter(Boolean)) {
+        const m = seg.match(/^(\d+)-(\d+)$/)
+        if (m) { if (!big || (+m[2] - +m[1]) > (big.hi - big.lo)) { if (big) rest.push(big.lo + '-' + big.hi); big = { lo: +m[1], hi: +m[2] } } else rest.push(seg) }
+        else rest.push(seg)
       }
-      ElMessage.success(`已拆成 ${k} 个子任务并行分发到 ${k} 个节点`)
+      const portSplit = big && (big.hi - big.lo) >= 1000 && targets.length < nids.length
+      let k = 0
+      if (portSplit) {
+        const step = Math.ceil((big.hi - big.lo + 1) / nids.length)
+        const extra = rest.join(',')
+        for (let s = big.lo; s <= big.hi; s += step) {
+          const id = nids[k % nids.length]
+          const slice = `${s}-${Math.min(s + step - 1, big.hi)}` + (extra ? ',' + extra : '')
+          await api.post('/tasks', { name: base + ' [' + (nameMap[id] || id) + ' ' + `${s}-${Math.min(s + step - 1, big.hi)}` + ']', targets, ports: slice, node_id: id, options: form.options })
+          k++
+        }
+        ElMessage.success(`已按端口分段拆成 ${k} 个子任务: ${targets.length}个目标 × 每台扫一段(${step}端口), ${k}台并行`)
+      } else {
+        // 勾选多节点: 目标轮询均分, 每节点一个子任务并行扫
+        const buckets = {}; nids.forEach(id => buckets[id] = [])
+        targets.forEach((t, i) => buckets[nids[i % nids.length]].push(t))
+        for (const id of nids) {
+          if (!buckets[id].length) continue
+          k++
+          await api.post('/tasks', { name: base + ' [' + (nameMap[id] || id) + ']', targets: buckets[id], ports: form.ports, node_id: id, options: form.options })
+        }
+        ElMessage.success(`已拆成 ${k} 个子任务并行分发到 ${k} 个节点`)
+      }
     }
     dlg.value = false
     form.name = ''; form.targets = ''; form.ports = ''; form.node_ids = []; form.options = emptyOptions(); uploadedTargets.value = []
