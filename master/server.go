@@ -744,14 +744,24 @@ func cleanupQueueByID(c *gin.Context, qkey, taskID string) {
 func handleDeleteTask(c *gin.Context) {
 	id := c.Param("id")
 	cleanupTask(c, id) // v57: 先全量清理再删行
-	db.Exec(`DELETE FROM tasks WHERE id=$1`, id)
+	if _, err := db.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
+		gologger.Error().Msgf("删除任务落库失败 %s: %v", id, err)
+		c.JSON(500, gin.H{"error": "删除落库失败: " + err.Error()})
+		return
+	}
 	c.JSON(200, gin.H{"ok": true})
 }
 
 func handleStopTask(c *gin.Context) {
 	id := c.Param("id")
 	cleanupTask(c, id)
-	db.Exec(`UPDATE tasks SET status='stopped', finished_at=now() WHERE id=$1 AND status IN ('pending','queued','scanning','stopping')`)
+	// v65f: 恢复丢失的id参数($1未绑定→PG报no parameter $1→Exec静默失败→停止200但状态不变,
+	// 2026-09-20线上事故: 并行编辑将该参数删掉被提交卷入); 终态Exec必须查错并落日志
+	if _, err := db.Exec(`UPDATE tasks SET status='stopped', finished_at=now() WHERE id=$1 AND status IN ('pending','queued','scanning','stopping')`, id); err != nil {
+		gologger.Error().Msgf("停止任务落库失败 %s: %v", id, err)
+		c.JSON(500, gin.H{"error": "停止落库失败: " + err.Error()})
+		return
+	}
 	c.JSON(200, gin.H{"ok": true})
 }
 
@@ -759,9 +769,13 @@ func handleRetryTask(c *gin.Context) {
 	id := c.Param("id")
 	cleanupTask(c, id)
 	// v57: retry重置ScanPhase(deep任务retry必须从阶段1重跑, 否则把IP目标当URL喂) + 清旧进度
-	db.Exec(`UPDATE tasks SET status='pending', progress=0, stage='',
+	if _, err := db.Exec(`UPDATE tasks SET status='pending', progress=0, stage='',
 		options = jsonb_set(options, '{scan_phase}', '""'::jsonb),
-		started_at=NULL, finished_at=NULL WHERE id=$1`, id)
+		started_at=NULL, finished_at=NULL WHERE id=$1`, id); err != nil {
+		gologger.Error().Msgf("重跑任务落库失败 %s: %v", id, err)
+		c.JSON(500, gin.H{"error": "重跑落库失败: " + err.Error()})
+		return
+	}
 	c.JSON(200, gin.H{"ok": true})
 }
 

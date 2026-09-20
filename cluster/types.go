@@ -23,21 +23,19 @@ const (
 	PullLivePrefix  = "task:pull:live:"  // 批内实时进度: 子进程每查完一个关键词INCR, 整批完成时父进程对冲扣回
 
 	// pull模式可靠领取: 节点BRPopLPush原子弹入本节点在途队列, 跑完LRem。
-	// 节点掉线时master把在途项按TaskID+Phase搬回公共队列(100%不丢)
-	QueuePullProcPrefix = "queue:pullproc:" // key=queue:pullproc:{nodeID}, 元素=PullInflight JSON
+	// 节点掉线时master把在途项搬回公共队列(100%不丢)
+	QueuePullProcPrefix = "queue:pullproc:" // key=queue:pullproc:{nodeID}:{taskID}[:{phase}], 元素=原始工作项串
 )
 
-// QueuePullProcKey 节点pull在途队列键
-func QueuePullProcKey(nodeID string) string {
-	return QueuePullProcPrefix + nodeID
-}
-
-// PullInflight 节点已领取未完成的pull工作项。Work是原始批次串(换行分隔),
-// 回搬公共队列时原样RPush, 与dispatch灌入格式完全一致
-type PullInflight struct {
-	TaskID string `json:"id"`
-	Phase  string `json:"phase,omitempty"`
-	Work   string `json:"w"`
+// QueuePullProcKey 节点pull在途队列键: 元素=原始工作项串(与公共队列完全同格式),
+// 键名自带nodeID/taskID/phase路由信息(master回收/清理按解析, 节点LRem按值精确匹配)。
+// 约束: nodeID与taskID不得含冒号(节点名默认node-IP, 任务ID=t+时间戳+随机串, 均满足)
+func QueuePullProcKey(nodeID, taskID, phase string) string {
+	k := QueuePullProcPrefix + nodeID + ":" + taskID
+	if phase != "" {
+		k += ":" + phase
+	}
+	return k
 }
 
 // QueuePullKey pull任务工作队列键: 每阶段独立键(queue:pull:{id}:map/:ports/:deep)。
