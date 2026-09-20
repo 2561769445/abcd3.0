@@ -716,7 +716,8 @@ func cleanupTask(c *gin.Context, id string) {
 	// 2) 清pull任务全套键
 	delPullQueues(c, rdb, id)
 	rdb.Del(c, cluster.PullTotalPrefix+id, cluster.PullDonePrefix+id,
-		"task:phase1wait:"+id, cluster.ProgressPrefix+id, cluster.TaskStatePrefix+id, "task:pull:phase2total:"+id)
+		"task:phase1wait:"+id, cluster.ProgressPrefix+id, cluster.TaskStatePrefix+id, "task:pull:phase2total:"+id,
+		"task:procwait:"+id) // v68: 在途残留确认计数键(有TTL自灭, 清理求干净)
 	forgetETA(id)
 	ForgetTask(id)
 	// 3) 从所有节点专属队列清本任务描述子
