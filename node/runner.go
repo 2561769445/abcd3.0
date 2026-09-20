@@ -161,10 +161,14 @@ func splitWorkItem(work string) []string {
 	return strings.Split(work, ",")
 }
 
-// runPullLoop pull模式拉取循环: BLPOP工作项 → 子进程执行 → 计数 → 循环直到队列空。
-// 多节点同抢一个队列, 谁空闲谁领得多; 中途stop=kill子进程+剩余工作项留队列(master可重推)。
+// runPullLoop pull模式拉取循环: BRPopLPush工作项(原子转入本节点在途队列) → 子进程执行
+// → 计数 → LRem在途 → 循环直到队列空。多节点同抢一个队列, 谁空闲谁领得多;
+// 中途stop=kill子进程+剩余工作项留队列(master可重推);
+// 节点崩溃时在途项留在pullproc队列, master回收搬回公共队列(100%不丢)。
+// 注: BRPopLPush从队尾弹(与旧版BLPop队头弹混布兼容), 批次间无依赖, 顺序无关。
 func runPullLoop(ctx context.Context, task *cluster.Task) {
 	qkey := cluster.QueuePullKey(task.ID, task.Options.ScanPhase)
+	procKey := cluster.QueuePullProcKey(opt.nodeID)
 	// 心跳标记正在跑pull任务(running_task= pull:{taskID}, master判定完成用它)
 	runningSet.Store("pull:"+task.ID, struct{}{})
 	defer runningSet.Delete("pull:" + task.ID)
@@ -178,8 +182,8 @@ func runPullLoop(ctx context.Context, task *cluster.Task) {
 			return
 		default:
 		}
-		// 10s超时BLPOP: 空手累计3次(30s)才收工 — 防描述子先到/工作项未灌完的时序误判
-		res, err := rdb.BLPop(ctx, 10*time.Second, qkey).Result()
+		// 10s超时阻塞领取, 原子弹入在途队列: 空手累计3次(30s)才收工 — 防描述子先到/工作项未灌完的时序误判
+		work, err := rdb.BRPopLPush(ctx, qkey, procKey, 10*time.Second).Result()
 		if err != nil {
 			if err == redis.Nil || ctx.Err() != nil {
 				idle++
@@ -194,12 +198,41 @@ func runPullLoop(ctx context.Context, task *cluster.Task) {
 			continue
 		}
 		idle = 0
-		if len(res) < 2 {
-			continue
-		}
-		work := res[1]
+		// 在途标记: 节点死在跑批途中时master按它搬回公共队列重新领
+		inf, _ := json.Marshal(cluster.PullInflight{TaskID: task.ID, Phase: task.Options.ScanPhase, Work: work})
 		gologger.Info().Msgf("pull领取: %s <- %s", task.ID, work)
 		execChild(ctx, task, work)
+		// 批次收尾(完成/被杀都算): 从在途队列移除。被杀场景master会cleanup该任务,
+		// 残留也会被purgeProcQueues兜底清, 这里LRem只是快路径
+		rctx, rc := context.WithTimeout(context.Background(), 5*time.Second)
+		rdb.LRem(rctx, procKey, 0, string(inf))
+		rc()
+	}
+}
+
+// selfHealInflight 节点启动自愈: 上次进程崩溃/重启时留在pullproc队列的在途项,
+// 先于任何领取动作搬回公共队列(master回收也覆盖此场景, 但自己搬零延迟;
+// 双方并发搬最坏=同批被扫两遍, 资产唯一键挡重复, done计数封顶, 无害)
+func selfHealInflight(ctx context.Context) {
+	procKey := cluster.QueuePullProcKey(opt.nodeID)
+	items, err := rdb.LRange(ctx, procKey, 0, -1).Result()
+	if err != nil || len(items) == 0 {
+		return
+	}
+	moved := 0
+	for _, raw := range items {
+		var inf cluster.PullInflight
+		if json.Unmarshal([]byte(raw), &inf) != nil || inf.TaskID == "" {
+			rdb.LRem(ctx, procKey, 0, raw) // 脏数据直接清
+			continue
+		}
+		if rdb.RPush(ctx, cluster.QueuePullKey(inf.TaskID, inf.Phase), inf.Work).Err() == nil {
+			rdb.LRem(ctx, procKey, 0, raw)
+			moved++
+		}
+	}
+	if moved > 0 {
+		gologger.Info().Msgf("节点重启自愈: %d个在途工作项已搬回公共队列", moved)
 	}
 }
 

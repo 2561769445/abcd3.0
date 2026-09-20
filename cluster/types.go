@@ -21,7 +21,24 @@ const (
 	PullTotalPrefix = "task:pull:total:" // 工作总量: key=task:pull:total:{taskID}
 	PullDonePrefix  = "task:pull:done:"  // 已完成数: key=task:pull:done:{taskID}(INCR)
 	PullLivePrefix  = "task:pull:live:"  // 批内实时进度: 子进程每查完一个关键词INCR, 整批完成时父进程对冲扣回
+
+	// pull模式可靠领取: 节点BRPopLPush原子弹入本节点在途队列, 跑完LRem。
+	// 节点掉线时master把在途项按TaskID+Phase搬回公共队列(100%不丢)
+	QueuePullProcPrefix = "queue:pullproc:" // key=queue:pullproc:{nodeID}, 元素=PullInflight JSON
 )
+
+// QueuePullProcKey 节点pull在途队列键
+func QueuePullProcKey(nodeID string) string {
+	return QueuePullProcPrefix + nodeID
+}
+
+// PullInflight 节点已领取未完成的pull工作项。Work是原始批次串(换行分隔),
+// 回搬公共队列时原样RPush, 与dispatch灌入格式完全一致
+type PullInflight struct {
+	TaskID string `json:"id"`
+	Phase  string `json:"phase,omitempty"`
+	Work   string `json:"w"`
+}
 
 // QueuePullKey pull任务工作队列键: 每阶段独立键(queue:pull:{id}:map/:ports/:deep)。
 // 阶段产物回流到下一阶段键 — 老阶段的拉取循环只认自己的键, 回流批不会被本阶段节点

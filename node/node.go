@@ -82,6 +82,9 @@ func Run() {
 	// Hunter全局令牌限速: 注入Redis客户端(多节点共用key时集群级节流)
 	uncover.SetHunterRedis(rdb)
 
+	// 上次崩溃/重启遗留的pull在途工作项先搬回公共队列(零延迟自愈)
+	selfHealInflight(nodeCtx)
+
 	// 心跳goroutine
 	go heartbeatLoop(nodeCtx, cancel)
 	// 控制指令订阅

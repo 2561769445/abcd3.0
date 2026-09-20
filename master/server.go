@@ -659,6 +659,8 @@ func cleanupTask(c *gin.Context, id string) {
 			cleanupQueueByID(c, cluster.QueueNodePrefix+nodeID, id)
 		}
 	}
+	// 3b) 清各节点pull在途队列里本任务的批次(任务已终止, 在途项不回灌直接丢弃)
+	purgeProcQueues(c, rdb, id)
 	// 4) 清公共队列里的本任务
 	cleanupQueueByID(c, cluster.QueueTasks, id)
 	// 5) 清描述子推送护栏键(retry后recoverStalled才能重新推)

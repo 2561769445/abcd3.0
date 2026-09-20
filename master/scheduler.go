@@ -46,6 +46,7 @@ func startScheduler(ctx context.Context, rdb *redis.Client) {
 			dispatchTasks(ctx, rdb)
 			syncProgress(ctx, rdb)
 			recoverStalled(ctx, rdb)
+			reclaimPullInflight(ctx, rdb) // 死节点在途批搬回公共队列(必须先于判done的finishScanning)
 			finishScanning(ctx, rdb)
 		}
 	}
@@ -421,6 +422,79 @@ func purgeNodeQueues(ctx context.Context, rdb *redis.Client, id string) {
 	}
 	for nodeID := range all {
 		purgeQueueByID(ctx, rdb, cluster.QueueNodePrefix+nodeID, id)
+	}
+}
+
+// reclaimPullInflight 回收死节点的pull在途工作项(100%不丢机制):
+// 节点BRPopLPush领取的工作项死在半路时, 在线节点的批次会被它一直扣着不释放。
+// 每 tick 扫全部 pullproc 键(SCAN兜住心跳已消失的节点), 节点离线(心跳≥60s或不在hash)
+// 就把它的在途项按TaskID+Phase搬回公共队列给在线节点重抢。
+// 挂在finishScanning之前: 判done/转段必先经过回收, 队列空才真收尾, 不会丢批。
+// 幂等: 搬走即LRem, 下个tick该键已空; 与节点启动自愈并发最坏=同批双扫(资产唯一键挡重, 无害)。
+// 时钟漂移误判(节点活着但心跳慢107s)同样只是双扫, 代价可接受。
+func reclaimPullInflight(ctx context.Context, rdb *redis.Client) {
+	all, _ := rdb.HGetAll(ctx, cluster.HashNodes).Result()
+	now := time.Now().Unix()
+	iter := rdb.Scan(ctx, 0, cluster.QueuePullProcPrefix+"*", 100).Iterator()
+	for iter.Next(ctx) {
+		procKey := iter.Val()
+		nodeID := strings.TrimPrefix(procKey, cluster.QueuePullProcPrefix)
+		if nodeID == "" {
+			continue
+		}
+		// 在线节点跳过: 它的在途项正在被正常执行, 等它跑完LRem
+		if raw, ok := all[nodeID]; ok {
+			var n nodeLive
+			if json.Unmarshal([]byte(raw), &n) == nil && now-n.Ts < 60 {
+				continue
+			}
+		}
+		items, err := rdb.LRange(ctx, procKey, 0, -1).Result()
+		if err != nil {
+			continue
+		}
+		moved, dropped := 0, 0
+		for _, raw := range items {
+			var inf cluster.PullInflight
+			if json.Unmarshal([]byte(raw), &inf) != nil || inf.TaskID == "" {
+				rdb.LRem(ctx, procKey, 0, raw) // 脏数据直接清
+				dropped++
+				continue
+			}
+			// 任务已终态/已删 → 在途项直接丢弃(不回灌成孤儿队列)
+			var status string
+			if db.QueryRow(`SELECT status FROM tasks WHERE id=$1`, inf.TaskID).Scan(&status) != nil ||
+				(status != "queued" && status != "scanning") {
+				rdb.LRem(ctx, procKey, 0, raw)
+				dropped++
+				continue
+			}
+			if rdb.RPush(ctx, cluster.QueuePullKey(inf.TaskID, inf.Phase), inf.Work).Err() == nil {
+				rdb.LRem(ctx, procKey, 0, raw)
+				moved++
+			}
+		}
+		if moved > 0 || dropped > 0 {
+			gologger.Info().Msgf("回收离线节点在途项: %s 搬回=%d 丢弃=%d", nodeID, moved, dropped)
+		}
+	}
+}
+
+// purgeProcQueues 清全部节点在途队列里该任务的条目(stop/删除/终态收尾时调用, 条目直接丢弃)
+func purgeProcQueues(ctx context.Context, rdb *redis.Client, taskID string) {
+	iter := rdb.Scan(ctx, 0, cluster.QueuePullProcPrefix+"*", 100).Iterator()
+	for iter.Next(ctx) {
+		procKey := iter.Val()
+		items, err := rdb.LRange(ctx, procKey, 0, -1).Result()
+		if err != nil {
+			continue
+		}
+		for _, raw := range items {
+			var inf cluster.PullInflight
+			if json.Unmarshal([]byte(raw), &inf) == nil && inf.TaskID == taskID {
+				rdb.LRem(ctx, procKey, 0, raw)
+			}
+		}
 	}
 }
 
@@ -874,6 +948,7 @@ func pullTaskDone(ctx context.Context, rdb *redis.Client, id string) {
 	notifyTaskDone(id)
 	// 收尾清理: 队列/计数键 + 节点队列残留描述子(不删会排队空转30s/个)
 	purgeNodeQueues(ctx, rdb, id)
+	purgeProcQueues(ctx, rdb, id)
 	delPullQueues(ctx, rdb, id)
 	rdb.Del(ctx, cluster.PullTotalPrefix+id, cluster.PullDonePrefix+id, cluster.PullLivePrefix+id)
 	settleTask(ctx, rdb, id)
