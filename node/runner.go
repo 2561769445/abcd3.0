@@ -168,7 +168,7 @@ func splitWorkItem(work string) []string {
 // 注: BRPopLPush从队尾弹(与旧版BLPop队头弹混布兼容), 批次间无依赖, 顺序无关。
 func runPullLoop(ctx context.Context, task *cluster.Task) {
 	qkey := cluster.QueuePullKey(task.ID, task.Options.ScanPhase)
-	procKey := cluster.QueuePullProcKey(opt.nodeID)
+	procKey := cluster.QueuePullProcKey(opt.nodeID, task.ID, task.Options.ScanPhase)
 	// 心跳标记正在跑pull任务(running_task= pull:{taskID}, master判定完成用它)
 	runningSet.Store("pull:"+task.ID, struct{}{})
 	defer runningSet.Delete("pull:" + task.ID)
@@ -198,41 +198,53 @@ func runPullLoop(ctx context.Context, task *cluster.Task) {
 			continue
 		}
 		idle = 0
-		// 在途标记: 节点死在跑批途中时master按它搬回公共队列重新领
-		inf, _ := json.Marshal(cluster.PullInflight{TaskID: task.ID, Phase: task.Options.ScanPhase, Work: work})
 		gologger.Info().Msgf("pull领取: %s <- %s", task.ID, work)
 		execChild(ctx, task, work)
-		// 批次收尾(完成/被杀都算): 从在途队列移除。被杀场景master会cleanup该任务,
-		// 残留也会被purgeProcQueues兜底清, 这里LRem只是快路径
-		rctx, rc := context.WithTimeout(context.Background(), 5*time.Second)
-		rdb.LRem(rctx, procKey, 0, string(inf))
-		rc()
+		// 批次收尾(完成/被杀都算): 从在途队列移除。值=work原始串, 与BRPopLPush
+		// 入队的元素完全一致, 精确匹配。重试3次: 高负载节点(portmux/双任务叠跑)LRem
+		// 可能超时静默失败, 残留由master的procPendingFor安全阀兜底清(节点收工=批次已计done)
+		for i := 0; i < 3; i++ {
+			rctx, rc := context.WithTimeout(context.Background(), 15*time.Second)
+			err := rdb.LRem(rctx, procKey, 0, work).Err()
+			rc()
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
 	}
 }
 
-// selfHealInflight 节点启动自愈: 上次进程崩溃/重启时留在pullproc队列的在途项,
+// selfHealInflight 节点启动自愈: 上次进程崩溃/重启时留在pullproc键里的在途项,
 // 先于任何领取动作搬回公共队列(master回收也覆盖此场景, 但自己搬零延迟;
 // 双方并发搬最坏=同批被扫两遍, 资产唯一键挡重复, done计数封顶, 无害)
 func selfHealInflight(ctx context.Context) {
-	procKey := cluster.QueuePullProcKey(opt.nodeID)
-	items, err := rdb.LRange(ctx, procKey, 0, -1).Result()
-	if err != nil || len(items) == 0 {
-		return
-	}
-	moved := 0
-	for _, raw := range items {
-		var inf cluster.PullInflight
-		if json.Unmarshal([]byte(raw), &inf) != nil || inf.TaskID == "" {
-			rdb.LRem(ctx, procKey, 0, raw) // 脏数据直接清
+	iter := rdb.Scan(ctx, 0, cluster.QueuePullProcPrefix+opt.nodeID+":*", 100).Iterator()
+	for iter.Next(ctx) {
+		procKey := iter.Val()
+		// 键=queue:pullproc:{nodeID}:{taskID}[:{phase}] → 解析路由
+		parts := strings.Split(strings.TrimPrefix(procKey, cluster.QueuePullProcPrefix), ":")
+		if len(parts) < 2 || parts[1] == "" {
+			rdb.Del(ctx, procKey) // 解析不出taskID的脏键直接清
 			continue
 		}
-		if rdb.RPush(ctx, cluster.QueuePullKey(inf.TaskID, inf.Phase), inf.Work).Err() == nil {
-			rdb.LRem(ctx, procKey, 0, raw)
-			moved++
+		taskID, phase := parts[1], ""
+		if len(parts) >= 3 {
+			phase = parts[2]
 		}
-	}
-	if moved > 0 {
-		gologger.Info().Msgf("节点重启自愈: %d个在途工作项已搬回公共队列", moved)
+		items, err := rdb.LRange(ctx, procKey, 0, -1).Result()
+		if err != nil || len(items) == 0 {
+			rdb.Del(ctx, procKey)
+			continue
+		}
+		vals := make([]interface{}, len(items))
+		for i, v := range items {
+			vals[i] = v
+		}
+		if rdb.RPush(ctx, cluster.QueuePullKey(taskID, phase), vals...).Err() == nil {
+			rdb.Del(ctx, procKey)
+			gologger.Info().Msgf("节点重启自愈: %s 搬回%d项 -> %s", taskID, len(items), cluster.QueuePullKey(taskID, phase))
+		}
 	}
 }
 
