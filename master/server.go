@@ -3,7 +3,11 @@ package master
 import (
 	"bufio"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
+	"io"
+	"sync"
 	"strconv"
 	"encoding/json"
 	"net/http"
@@ -214,19 +218,44 @@ systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet ch
 # upgrade模式: 已有service则只换二进制并restart(供节点升级场景复用同一脚本)
 UPGRADE=0
 systemctl list-unit-files 2>/dev/null | grep -q "^abcd-node.service" && UPGRADE=1
-echo "[2/5] download node binary ($BIN, prefer gz ~1/3 size)..."
+echo "[2/5] download node binary ($BIN, resumable+md5-verified)..."
 mkdir -p /opt/abcd-node-dl
 DLURL="http://$MASTER/dl"
-rm -f /opt/abcd-node-dl/"$BIN".gz /opt/abcd-node-dl/"$BIN"
-if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 -o /opt/abcd-node-dl/"$BIN".gz "$DLURL/$BIN.gz?k=$KEY"; then
-  gunzip -f /opt/abcd-node-dl/"$BIN".gz && mv -f /opt/abcd-node-dl/"$BIN" /opt/abcd-node
+case $BIN in
+  abcd_linux_amd64) MD5="__MD5AMD64__";;
+  *) MD5="__MD5ARM64__";;
+esac
+GZ=/opt/abcd-node-dl/"$BIN".gz
+# v65e: 部分节点到主控口的网络路径对大文件不稳(实测单次传~2MB即断), 且无续传的
+# 单次下载在坏路径上必失败 — 改-C -断点续传循环(最多30次, 每次gunzip -t验完整性)。
+# curl认为已完成却校验不过 = 跨版本残留半截+续传拼出的损坏混合体, 删掉整文件重来。
+ok=0
+for i in $(seq 1 30); do
+  if curl -fsSL --connect-timeout 10 -C - -o "$GZ" "$DLURL/$BIN.gz?k=$KEY"; then
+    gunzip -t "$GZ" 2>/dev/null && { ok=1; break; } || rm -f "$GZ"
+  else
+    gunzip -t "$GZ" 2>/dev/null && { ok=1; break; }
+  fi
+  sleep 2
+done
+if [ "$ok" = 1 ]; then
+  gunzip -f "$GZ" && mv -f /opt/abcd-node-dl/"$BIN" /opt/abcd-node
 else
-  echo "  gz not available, fallback to raw binary (slow)..."
-  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 -C - -o /opt/abcd-node "$DLURL/$BIN?k=$KEY" || { echo "download failed: check network / key k"; exit 1; }
+  echo "  gz path exhausted, fallback to raw binary (resumable loop)..."
+  RAW=/opt/abcd-node-dl/"$BIN".raw
+  ok=0
+  for i in $(seq 1 40); do
+    curl -fsSL --connect-timeout 10 -C - -o "$RAW" "$DLURL/$BIN?k=$KEY" && { ok=1; break; }
+    sleep 2
+  done
+  [ "$ok" = 1 ] || { echo "download failed: check network / key k"; exit 1; }
+  mv -f "$RAW" /opt/abcd-node
 fi
 chmod +x /opt/abcd-node
 head -c 4 /opt/abcd-node | grep -q ELF || { echo "binary check failed (not ELF, truncated?)"; exit 1; }
-echo "  downloaded: $(du -h /opt/abcd-node | cut -f1)"
+# 终极门禁: 与主控下发时嵌入的dl目录二进制md5比对, 任何截断/跨版本混合体在此拦截
+echo "$MD5  /opt/abcd-node" | md5sum -c - >/dev/null 2>&1 || { echo "md5 mismatch (corrupt or stale dl on master?); cleaned partial, retry install"; rm -f "$GZ"; exit 1; }
+echo "  downloaded+verified: $(du -h /opt/abcd-node | cut -f1)"
 echo "[3/5] write systemd service..."
 if [ "$UPGRADE" = 1 ]; then
   # 升级路径: 二进制已在[2/5]原子落位(/opt/abcd-node), 此处直接restart。
@@ -265,8 +294,48 @@ echo "uninstall cmd: curl -s \"http://$MASTER/uninstall.sh?k=$KEY\" | bash"
 	script = strings.ReplaceAll(script, "__MASTER__", masterAdvertiseAddr(c))
 	script = strings.ReplaceAll(script, "__KEY__", installKey)
 	script = strings.ReplaceAll(script, "__REDISPASS__", cfg.RedisPass)
+	// v65e: 嵌入dl目录二进制md5, 安装脚本侧续传循环+最终md5门禁(坏网络路径不再一次断=装失败)
+	script = strings.ReplaceAll(script, "__MD5AMD64__", dlBinaryMD5("abcd_linux_amd64"))
+	script = strings.ReplaceAll(script, "__MD5ARM64__", dlBinaryMD5("abcd_linux_arm64"))
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.String(200, script)
+}
+
+// dlBinaryMD5 dl目录二进制的md5(mtime+size缓存, 文件不变不重算; 120MB算一次~1s)
+// 不存在时返回空串 — 脚本侧md5sum -c对空串必然失败=门禁保持开启
+var dlMD5Cache sync.Map // name -> struct{size, mtime, md5}
+
+func dlBinaryMD5(name string) string {
+	p := dlDir + "/" + name
+	st, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	if v, ok := dlMD5Cache.Load(name); ok {
+		if c := v.(struct {
+			size  int64
+			mtime int64
+			md5   string
+		}); c.size == st.Size() && c.mtime == st.ModTime().Unix() {
+			return c.md5
+		}
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	dlMD5Cache.Store(name, struct {
+		size  int64
+		mtime int64
+		md5   string
+	}{st.Size(), st.ModTime().Unix(), sum})
+	return sum
 }
 
 // handleUninstallScript 生成一键卸载脚本(与install.sh同密钥鉴权)
