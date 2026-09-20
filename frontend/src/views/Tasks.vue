@@ -99,7 +99,7 @@
           <el-input v-model="form.ports" placeholder="留空=Top1000, 示例: 80,443,8080 或 1-65535" />
         </el-form-item>
         <el-form-item label="执行节点">
-          <el-select v-model="form.node_ids" multiple collapse-tags collapse-tags-tooltip clearable placeholder="不选=所有在线节点均分并行扫; 勾选=指定节点" style="width:100%">
+          <el-select v-model="form.node_ids" multiple collapse-tags collapse-tags-tooltip clearable placeholder="不选=全员并行(多目标:拉模式动态抢单 / 少目标大端口:分段); 勾选=钉死指定节点" style="width:100%">
             <el-option v-for="n in nodes" :key="n.id" :value="n.id" :label="`${n.name} (${n.online?'在线':'离线'})`" />
           </el-select>
         </el-form-item>
@@ -363,11 +363,33 @@ async function save() {
     finally { saving.value = false }
     return
   }
-  // 不选执行节点 = 所有在线节点均分并行扫
-  const nids = (form.node_ids && form.node_ids.length)
-    ? form.node_ids
-    : nodes.value.filter(n => n.online).map(n => n.id)
+  // v67 分发决策: 勾选节点=静态指定(钉死该几台); 不选=全员并行 —
+  // 少目标+大端口范围走v66端口分段(静态均分每台一段, 对单目标最优);
+  // 其余一律转拉模式(单任务进公共队列, 谁闲谁抢批 — 先干完的自动帮慢的, 掉线批次自动回收,
+  // 根治"预分8份, 7台干完干等最慢1台"的短板)
+  const explicit = !!(form.node_ids && form.node_ids.length)
+  const nids = explicit ? form.node_ids : nodes.value.filter(n => n.online).map(n => n.id)
   if (!nids.length) return ElMessage.warning('没有在线节点, 无法创建任务')
+  // 端口分段条件(与下方同源): 最大端口范围跨度≥1000 且 目标数<节点数
+  const pstr0 = (form.ports || '').replace(/\s/g, '')
+  let big0 = null
+  for (const seg of pstr0.split(',').filter(Boolean)) {
+    const m = seg.match(/^(\d+)-(\d+)$/)
+    if (m && (!big0 || (+m[2] - +m[1]) > (big0.hi - big0.lo))) big0 = { lo: +m[1], hi: +m[2] }
+  }
+  const canPortSplit = big0 && (big0.hi - big0.lo) >= 1000 && targets.length < nids.length
+  if (!explicit && !canPortSplit && nids.length > 1) {
+    form.options.mode = 'pull'
+    try {
+      saving.value = true
+      await api.post('/tasks', { name: form.name || '未命名任务', targets, ports: form.ports, node_id: '', options: form.options })
+      ElMessage.success(`已创建拉模式任务: ${targets.length}个目标进公共队列, ${nids.length}台节点动态抢单(先干完的自动帮慢的)`)
+      dlg.value = false
+      form.name = ''; form.targets = ''; form.ports = ''; form.node_ids = []; form.options = emptyOptions(); uploadedTargets.value = []
+    } catch (e) { ElMessage.error(e.response?.data?.error || '创建失败') }
+    finally { saving.value = false }
+    return
+  }
   saving.value = true
   try {
     if (nids.length <= 1) {
