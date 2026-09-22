@@ -282,17 +282,24 @@ func dispatchPullTask(ctx context.Context, rdb *redis.Client, id, name, ports st
 	// map阶段目标混有URL时(测绘导出脏数据/历史清单): URL直接预置进下一阶段ports键,
 	// 不进:map — 否则引擎把URL当查询串发Hunter("字段http不支持查询"+3次重试退避+3s令牌),
 	// 每个脏URL耗~35秒, 63批拖15小时(2026-09-15事故)
+	// v70 再分桶: 语法查询串(icp.name=公司名等)与普通目标(域名/IP)分开打包不混批 —
+	// 节点按批型路由引擎(语法批→Hunter独跑, 普通批→Fofa+Quake并行), 混批会整体
+	// 降级走Hunter(3s全局限速闸拖慢+烧积分)。语法批灌在前, 单位收集任务先出结果。
 	mapBatch, urlBatch := cleaned, []string(nil)
 	if opts.ScanPhase == "map" {
-		mapBatch = make([]string, 0, len(cleaned))
+		synBatch := make([]string, 0, len(cleaned))
+		plainBatch := make([]string, 0, len(cleaned))
 		urlBatch = make([]string, 0)
 		for _, t := range cleaned {
 			if strings.Contains(t, "://") {
 				urlBatch = append(urlBatch, t)
+			} else if cluster.IsSyntaxQuery(t) {
+				synBatch = append(synBatch, t)
 			} else {
-				mapBatch = append(mapBatch, t)
+				plainBatch = append(plainBatch, t)
 			}
 		}
+		mapBatch = append(synBatch, plainBatch...)
 	}
 	items := make([]interface{}, 0, (len(mapBatch)+batch-1)/batch)
 	for i := 0; i < len(mapBatch); i += batch {

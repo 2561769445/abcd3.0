@@ -518,15 +518,30 @@ func executeScan(ctx context.Context, task *cluster.Task) error {
 	if !cfg.Hunter && !cfg.Fofa && !cfg.Quake {
 		engines := availableMapEngines()
 		if task.Options.ScanPhase == "map" && len(engines) > 0 {
-			// map阶段: 工作项本身就是测绘查询串, 直接开全部已配key引擎
-			// (不能走下面的域名过滤 — icp.name=语法不是域名类型, 会被过滤成空列表)
+			// v70 引擎分流: 语法查询串(icp.name=公司名等)只有Hunter完整支持→Hunter独跑;
+			// 普通目标(域名/IP)→Fofa+Quake并行 — Hunter不再参与域名测绘:
+			// ①3s全局限速闸被域名查询占满会拖慢语法批 ②翻页大户烧Hunter积分
+			// ③fofa/quake各自独立限速, 并行后吞吐翻倍。
+			// 混批(语法+普通, master分桶前的存量)整体走Hunter保底不丢目标;
+			// fofa/quake都无key时降级Hunter。
+			hasHunter := false
 			for _, e := range engines {
 				if e == "hunter" {
-					cfg.Hunter = true
-				} else if e == "fofa" {
-					cfg.Fofa = true
-				} else if e == "quake" {
-					cfg.Quake = true
+					hasHunter = true
+				}
+			}
+			if hasHunter && batchHasSyntax(task.Targets) {
+				cfg.Hunter = true
+			} else {
+				for _, e := range engines {
+					if e == "fofa" {
+						cfg.Fofa = true
+					} else if e == "quake" {
+						cfg.Quake = true
+					}
+				}
+				if !cfg.Fofa && !cfg.Quake && hasHunter {
+					cfg.Hunter = true // fofa/quake都没key: 降级
 				}
 			}
 		} else if hasDomainTarget(task.Targets) && len(engines) > 0 {
@@ -654,6 +669,17 @@ func joinTargets(ts []string) string {
 		s += t
 	}
 	return s
+}
+
+// batchHasSyntax 批内是否含测绘引擎语法查询串(icp.name=公司名等) —
+// 引擎分流判定: 语法批走Hunter独跑, 与master灌批分桶共用cluster.IsSyntaxQuery口径
+func batchHasSyntax(targets []string) bool {
+	for _, t := range targets {
+		if cluster.IsSyntaxQuery(t) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasDomainTarget 目标里是否含域名(非纯IP/CIDR/URL也算)

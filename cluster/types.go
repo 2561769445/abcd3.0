@@ -1,6 +1,9 @@
 package cluster
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // 分布式主控-分节点共享协议类型与Redis键名常量
 
@@ -51,6 +54,18 @@ func QueuePullKey(taskID, phase string) string {
 
 // PullPhases 阶段顺序(map→ports→deep), 单阶段任务只走deep或全程一键
 var PullPhases = []string{"map", "ports", "deep"}
+
+// IsSyntaxQuery 是否为测绘引擎语法查询串(icp.name="公司"/domain="x"等k=v形式,
+// 或quake的domain:"x"冒号+引号形式)。语法串只有Hunter完整支持(单位收集icp.name=
+// fofa/quake直接报语法错); 普通目标(域名/IP/URL)三家引擎都能查。
+// URL(含://)与IP:port(无引号)不算语法。master灌批分桶与节点引擎分流共用此口径。
+func IsSyntaxQuery(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.Contains(s, "://") {
+		return false
+	}
+	return strings.Contains(s, "=") || strings.Contains(s, `:"`)
+}
 
 // ScanOptions 任务携带的扫描参数(完整映射structs.GlobalConfig, 与命令行功能对齐)
 type ScanOptions struct {

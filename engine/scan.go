@@ -21,6 +21,7 @@ import (
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"strings"
+	"sync"
 )
 
 // StageHook 分布式模式: 扫描阶段推进回调(节点用于上报进度)
@@ -551,6 +552,30 @@ func cancelled(ctx context.Context) bool {
 }
 
 func searchEngine() {
+	// v70 Fofa+Quake双开(无Hunter): 两引擎并行查同一目标集, 结果合并去重。
+	// 这是map引擎分流后域名/IP测绘的主路径 — fofa/quake各自独立限速,
+	// 吞吐=两引擎之和, 不挤Hunter的3s全局限速闸。必须放在下方互斥分支之前,
+	// 否则被"Fofa&&!Hunter"短路成只跑fofa(quake闲置)。
+	if structs.GlobalConfig.Fofa && structs.GlobalConfig.Quake && !structs.GlobalConfig.Hunter {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		merged := make([]string, 0, 256)
+		for _, search := range []func([]string) []string{
+			uncover.FOFASearch, uncover.QuakeSearch,
+		} {
+			wg.Add(1)
+			go func(f func([]string) []string) {
+				defer wg.Done()
+				res := f(structs.GlobalConfig.Targets)
+				mu.Lock()
+				merged = append(merged, res...)
+				mu.Unlock()
+			}(search)
+		}
+		wg.Wait()
+		structs.GlobalConfig.Targets = utils.RemoveDuplicateElement(merged)
+		return
+	}
 	// 从Hunter中获取资产
 	if structs.GlobalConfig.Hunter && !structs.GlobalConfig.Fofa {
 		structs.GlobalConfig.Targets, _ = uncover.HunterSearch(structs.GlobalConfig.Targets)
