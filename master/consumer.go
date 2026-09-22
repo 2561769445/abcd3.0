@@ -151,9 +151,16 @@ func parseNucleiJSON(raw, show, fallbackTarget string) (name, sev, target string
 					Severity string `json:"severity"`
 				} `json:"SeverityHolder"`
 			} `json:"Info"`
-			// 兼容小写序列化
+			// 小写键序列化(v71实测线上节点即此格式): template-id/matched-at带连字符,
+			// Go json大小写不敏感匹配不到; info.severity是扁平字符串无SeverityHolder嵌套层
 			TemplateID2 string `json:"template-id"`
+			MatchedAt   string `json:"matched-at"`
+			URL         string `json:"url"`
 			Host        string `json:"host"`
+			InfoLower   struct {
+				Name     string `json:"name"`
+				Severity string `json:"severity"`
+			} `json:"info"`
 		}
 		if err := json.Unmarshal([]byte(raw), &ev); err == nil {
 			if ev.TemplateID != "" {
@@ -163,9 +170,17 @@ func parseNucleiJSON(raw, show, fallbackTarget string) (name, sev, target string
 			}
 			if ev.Info.SeverityHolder.Severity != "" {
 				sev = normSeverity(ev.Info.SeverityHolder.Severity)
+			} else if ev.InfoLower.Severity != "" {
+				sev = normSeverity(ev.InfoLower.Severity)
 			}
 			if ev.Matched != "" {
 				target = ev.Matched
+			} else if ev.MatchedAt != "" {
+				target = ev.MatchedAt
+			} else if ev.URL != "" {
+				target = ev.URL
+			} else if ev.Host != "" {
+				target = ev.Host
 			}
 		}
 	}
