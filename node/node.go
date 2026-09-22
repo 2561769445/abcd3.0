@@ -326,10 +326,23 @@ func taskLoop(ctx context.Context) {
 			gologger.Error().Msgf("任务解析失败: %v", err)
 			continue
 		}
-		// pull描述子: 进入拉取循环(子进程逐项消费工作队列), 不占并发信号量(循环内部串行)
+		// pull描述子: 进入拉取循环(子进程逐项消费工作队列), 占1个并发槽与普通任务同池。
+		// 循环goroutine化 = 节点可同时服务多个pull任务(v69前主循环同步阻塞在runPullLoop里,
+		// 8节点全被一个长任务deep阶段占满时, 后续pull任务描述子全部排队没人领)。
+		// 同任务同phase的重复描述子(recoverStalled重推/查重竞态副本)原子防重跳过;
+		// 循环收工时按同键Delete自动解锁, master后续重推描述子可再进。
 		if task.Options.Mode == "pull" && len(task.Targets) == 0 {
-			gologger.Info().Msgf("pull描述子领取: %s", task.ID)
-			runPullLoop(ctx, &task)
+			hbKey := "pull:" + task.ID + ":" + task.Options.ScanPhase
+			if _, dup := runningSet.LoadOrStore(hbKey, struct{}{}); dup {
+				gologger.Info().Msgf("pull描述子跳过(该阶段循环已在跑): %s phase=%s", task.ID, task.Options.ScanPhase)
+				continue
+			}
+			gologger.Info().Msgf("pull描述子领取: %s phase=%s", task.ID, task.Options.ScanPhase)
+			sem <- struct{}{}
+			go func(t cluster.Task) {
+				defer func() { <-sem }()
+				runPullLoop(ctx, &t)
+			}(task)
 			continue
 		}
 		// 全部走子进程: 信号量限并发, 进程级隔离(停止=kill进程组秒停, 引擎阶段内不响应取消的问题根除)

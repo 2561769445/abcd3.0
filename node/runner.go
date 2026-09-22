@@ -165,13 +165,18 @@ func splitWorkItem(work string) []string {
 // → 计数 → LRem在途 → 循环直到队列空。多节点同抢一个队列, 谁空闲谁领得多;
 // 中途stop=kill子进程+剩余工作项留队列(master可重推);
 // 节点崩溃时在途项留在pullproc队列, master回收搬回公共队列(100%不丢)。
+// v69: 循环由taskLoop按并发槽goroutine化 — 单节点可并行多个pull任务(每任务占1槽),
+// 本函数自身逻辑不变(循环内子进程仍串行, 每时刻1个子进程)。
 // 注: BRPopLPush从队尾弹(与旧版BLPop队头弹混布兼容), 批次间无依赖, 顺序无关。
 func runPullLoop(ctx context.Context, task *cluster.Task) {
 	qkey := cluster.QueuePullKey(task.ID, task.Options.ScanPhase)
 	procKey := cluster.QueuePullProcKey(opt.nodeID, task.ID, task.Options.ScanPhase)
-	// 心跳标记正在跑pull任务(running_task= pull:{taskID}, master判定完成用它)
-	runningSet.Store("pull:"+task.ID, struct{}{})
-	defer runningSet.Delete("pull:" + task.ID)
+	// 心跳标记正在跑pull任务(running_task= pull:{taskID}:{phase}, master前缀Contains判定兼容)。
+	// 键带phase且与taskLoop的LoadOrStore防重登记同键: 多pull循环并行后, 其他循环的
+	// 收工Delete不会误删本条目(master判活/防提前done全靠它)
+	hbKey := "pull:" + task.ID + ":" + task.Options.ScanPhase
+	runningSet.Store(hbKey, struct{}{}) // 幂等: taskLoop领描述子时已LoadOrStore登记
+	defer runningSet.Delete(hbKey)
 
 	gologger.Info().Msgf("进入pull循环: %s 队列=%s", task.ID, qkey)
 	idle := 0 // 连续空手次数: 描述子可能先于master灌工作项到达, 要容忍前几个10s空窗
