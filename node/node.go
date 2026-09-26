@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -151,16 +152,37 @@ func heartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 	}
 }
 
+// ctrlLoop 控制指令订阅循环。
+// 外层for+重订阅: 旧版Channel()关闭(!ok)后直接return — 节点心跳照常但控制通道永久失聪
+// (182长期"exec 504"根因: pubsub断连后没有重建机制)。
 func ctrlLoop(ctx context.Context, cancel context.CancelFunc) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		err := ctrlLoopOnce(ctx, cancel)
+		if ctx.Err() != nil {
+			return
+		}
+		gologger.Warning().Msgf("控制订阅断开(%v), 5秒后重建 — 修复旧版断连后节点失聪", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func ctrlLoopOnce(ctx context.Context, cancel context.CancelFunc) error {
 	sub := rdb.Subscribe(ctx, cluster.CtrlChannelPre+opt.nodeID, cluster.CtrlChannelPre+"all")
 	defer sub.Close()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case msg, ok := <-sub.Channel():
 			if !ok {
-				return
+				return fmt.Errorf("pubsub channel closed")
 			}
 			var cm cluster.CtrlMessage
 			if err := json.Unmarshal([]byte(msg.Payload), &cm); err != nil {
@@ -323,7 +345,7 @@ func ctrlLoop(ctx context.Context, cancel context.CancelFunc) {
 					_ = exec.Command("/bin/sh", "-c", "systemctl stop abcd-node").Run()
 				}
 				cancel()
-				return
+				return nil
 			}
 		}
 	}
