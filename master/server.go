@@ -868,6 +868,9 @@ func handleNodeOffline(c *gin.Context) {
 
 // nodeCtrlRound 发布指令并轮询回执(文件/目录操作共用)
 func nodeCtrlRound(c *gin.Context, action, path string, wait time.Duration) string {
+	if ok, _ := rdb.HExists(c, cluster.HashNodes, c.Param("id")).Result(); !ok {
+		return "ERR node not found: 核对节点ID(不是机器名/历史旧名)"
+	}
 	execID := "e" + time.Now().Format("20060102150405") + randSuffix()
 	publishCtrl(c, c.Param("id"), cluster.CtrlMessage{Action: action, Cmd: path, ExecID: execID})
 	deadline := time.Now().Add(wait)
@@ -965,6 +968,12 @@ func handleNodeLs(c *gin.Context) {
 
 // handleNodeExec 对节点远程执行命令(Web运维通道): 发布exec指令 → 轮询回执
 func handleNodeExec(c *gin.Context) {
+	// 节点存在性校验: Publish不校验直接发虚空频道=永远超时, 极易误导排障
+	// (vps182旧名坑: 机器重装后nodeID变node-IP, 旧名指令全进无人订阅频道)
+	if ok, _ := rdb.HExists(c, cluster.HashNodes, c.Param("id")).Result(); !ok {
+		c.JSON(404, gin.H{"error": "节点不存在(核对节点ID: 用节点列表的ID列, 不是机器名/历史旧名)"})
+		return
+	}
 	var req struct {
 		Cmd     string `json:"cmd"`
 		Timeout int    `json:"timeout"` // 秒, 默认120
