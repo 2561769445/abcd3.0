@@ -77,6 +77,25 @@ func handleResult(payload string) {
 		gologger.Warning().Msgf("结果信封解析失败: %v", err)
 		return
 	}
+	// 驼峰键别名兜底: 注入测试常用TaskID/NodeID(大写驼峰), 与tag(task_id)差一个下划线,
+	// Go json的大小写不敏感匹配跨不过下划线 → 静默解析成空task_id写成孤儿行
+	if env.TaskID == "" || env.NodeID == "" {
+		var alias struct {
+			TaskID string `json:"TaskID"`
+			NodeID string `json:"NodeID"`
+		}
+		_ = json.Unmarshal([]byte(payload), &alias)
+		if env.TaskID == "" {
+			env.TaskID = alias.TaskID
+		}
+		if env.NodeID == "" {
+			env.NodeID = alias.NodeID
+		}
+	}
+	if env.TaskID == "" {
+		gologger.Warning().Msgf("结果信封缺task_id(键名不符), 丢弃: %.200s", payload)
+		return
+	}
 	var msg ddout.OutputMessage
 	if err := json.Unmarshal(env.Msg, &msg); err != nil {
 		gologger.Warning().Msgf("结果消息解析失败: %v", err)

@@ -177,4 +177,5 @@ type CtrlMessage struct {
 	Session string `json:"session,omitempty"` // 终端会话ID(维持cwd)
 	ExecID  string `json:"exec_id,omitempty"` // exec回执ID
 	Timeout int    `json:"timeout,omitempty"` // exec超时秒
+	Sig     string `json:"sig,omitempty"`     // HMAC-SHA256签名(ABCD_CTRL_SECRET非空时强制, 见sign.go)
 }

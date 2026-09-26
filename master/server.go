@@ -10,6 +10,7 @@ import (
 	"sync"
 	"strconv"
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -157,6 +158,17 @@ func bodyLimit(c *gin.Context) {
 var dlDir = getenv2("ABCD_DL_DIR", "/opt/abcd-distributed/dl")
 var installKey = getenv2("ABCD_INSTALL_KEY", "abcd-install-2026")
 
+// ctrlSecret 控制指令HMAC签名密钥(master与节点service同配ABCD_CTRL_SECRET生效)。
+// 空=明文兼容模式(升级窗口期/未配置); 非空=全部ctrl指令签名下发, 节点强制验签。
+var ctrlSecret = os.Getenv("ABCD_CTRL_SECRET")
+
+// publishCtrl 统一控制指令下发口: 签名后Publish(所有CtrlMessage必经, 防漏签)
+func publishCtrl(c *gin.Context, nodeID string, cm cluster.CtrlMessage) {
+	cm.Sig = cluster.SignCtrl(ctrlSecret, &cm)
+	msg, _ := marshalJSON(cm)
+	rdb.Publish(c, cluster.CtrlChannelPre+nodeID, msg)
+}
+
 func getenv2(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -277,6 +289,8 @@ WorkingDirectory=/opt
 ExecStart=/opt/abcd-node -node -r $MASTER -rp __REDISPASS__ -n $NAME
 # 并发任务数: 每个任务fork子进程隔离执行, 同节点可同时跑N个任务(改N后daemon-reload+restart生效)
 Environment=ABCD_NODE_CONCURRENCY=2
+# 控制指令HMAC验签密钥(与master的ABCD_CTRL_SECRET同值; 空=明文兼容)
+Environment=ABCD_CTRL_SECRET=__CTRLSECRET__
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -294,6 +308,7 @@ echo "uninstall cmd: curl -s \"http://$MASTER/uninstall.sh?k=$KEY\" | bash"
 	script = strings.ReplaceAll(script, "__MASTER__", masterAdvertiseAddr(c))
 	script = strings.ReplaceAll(script, "__KEY__", installKey)
 	script = strings.ReplaceAll(script, "__REDISPASS__", cfg.RedisPass)
+	script = strings.ReplaceAll(script, "__CTRLSECRET__", ctrlSecret)
 	// v65e: 嵌入dl目录二进制md5, 安装脚本侧续传循环+最终md5门禁(坏网络路径不再一次断=装失败)
 	script = strings.ReplaceAll(script, "__MD5AMD64__", dlBinaryMD5("abcd_linux_amd64"))
 	script = strings.ReplaceAll(script, "__MD5ARM64__", dlBinaryMD5("abcd_linux_arm64"))
@@ -471,13 +486,31 @@ func handleChangePassword(c *gin.Context) {
 
 // ---------- 鉴权 ----------
 
-// handleLogin 登录换取JWT。失败限速: 连续10次失败全局锁15分钟, 成功登录即清零。
-// 用全局计数而非per-IP: 入口portmux是L4透传, master看到的公网源IP全是127.0.0.1,
-// per-IP会把所有访客折进同一个桶(等效全局), 干脆显式全局并靠成功清零降低误伤。
+// muxClientIP 取真实客户端IP: portmux(L4透传)方向源IP恒为回环, 改用它在请求行后注入的
+// X-Real-IP(注入位置在客户端自带头之前, Header.Get取首值, 客户端无法伪造排位);
+// 直连8080场景RemoteAddr即真实IP。portmux二进制与master需配套升级(旧portmux无注入→退回全局桶)。
+func muxClientIP(c *gin.Context) string {
+	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err == nil && (host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost")) {
+		if xr := c.GetHeader("X-Real-IP"); xr != "" {
+			return xr
+		}
+	}
+	return c.ClientIP()
+}
+
+// handleLogin 登录换取JWT。失败限速双层: per-IP连续10次失败锁15分钟 +
+// 全局100次/15分钟兜底(慢速分布式爆破/旧portmux无IP注入时全体折进回环桶)。
+// 成功登录只清本IP计数; 全局键15分钟自然过期。
 func handleLogin(c *gin.Context) {
-	failKey := "login:fail:global"
-	if n, _ := rdb.Get(c, failKey).Int(); n >= 10 {
+	ipKey := "login:fail:ip:" + muxClientIP(c)
+	gKey := "login:fail:global"
+	if n, _ := rdb.Get(c, ipKey).Int(); n >= 10 {
 		c.JSON(429, gin.H{"error": "登录尝试次数过多, 请15分钟后再试"})
+		return
+	}
+	if n, _ := rdb.Get(c, gKey).Int(); n >= 100 {
+		c.JSON(429, gin.H{"error": "登录尝试次数过多(全局), 请15分钟后再试"})
 		return
 	}
 	var req struct {
@@ -489,12 +522,14 @@ func handleLogin(c *gin.Context) {
 		return
 	}
 	if req.Username != cfg.AdminUser || req.Password != getAdminPass() {
-		rdb.Incr(c, failKey)
-		rdb.Expire(c, failKey, 15*time.Minute)
+		rdb.Incr(c, ipKey)
+		rdb.Expire(c, ipKey, 15*time.Minute)
+		rdb.Incr(c, gKey)
+		rdb.Expire(c, gKey, 15*time.Minute)
 		c.JSON(401, gin.H{"error": "用户名或密码错误"})
 		return
 	}
-	rdb.Del(c, failKey)
+	rdb.Del(c, ipKey)
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user": req.Username,
 		"exp":  time.Now().Add(24 * time.Hour).Unix(),
@@ -711,8 +746,7 @@ func handleGetTask(c *gin.Context) {
 // 杀子进程+清pull三键+清阶段1等待计数+从所有节点专属队列LREM本任务描述子, 根除死任务复活/空转/孤儿
 func cleanupTask(c *gin.Context, id string) {
 	// 1) 广播stop(杀在跑子进程)
-	msg, _ := marshalJSON(cluster.CtrlMessage{Action: "stop", TaskID: id})
-	rdb.Publish(c, cluster.CtrlChannelPre+"all", msg)
+	publishCtrl(c, "all", cluster.CtrlMessage{Action: "stop", TaskID: id})
 	// 2) 清pull任务全套键
 	delPullQueues(c, rdb, id)
 	rdb.Del(c, cluster.PullTotalPrefix+id, cluster.PullDonePrefix+id,
@@ -828,16 +862,14 @@ func handleNodeWeight(c *gin.Context) {
 }
 
 func handleNodeOffline(c *gin.Context) {
-	msg, _ := marshalJSON(cluster.CtrlMessage{Action: "shutdown"})
-	rdb.Publish(c, cluster.CtrlChannelPre+c.Param("id"), msg)
+	publishCtrl(c, c.Param("id"), cluster.CtrlMessage{Action: "shutdown"})
 	c.JSON(200, gin.H{"ok": true})
 }
 
 // nodeCtrlRound 发布指令并轮询回执(文件/目录操作共用)
 func nodeCtrlRound(c *gin.Context, action, path string, wait time.Duration) string {
 	execID := "e" + time.Now().Format("20060102150405") + randSuffix()
-	msg, _ := marshalJSON(cluster.CtrlMessage{Action: action, Cmd: path, ExecID: execID})
-	rdb.Publish(c, cluster.CtrlChannelPre+c.Param("id"), msg)
+	publishCtrl(c, c.Param("id"), cluster.CtrlMessage{Action: action, Cmd: path, ExecID: execID})
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if v, err := rdb.Get(c, cluster.ExecResultPrefix+execID).Result(); err == nil {
@@ -870,8 +902,7 @@ func handleNodeFileUpload(c *gin.Context) {
 	_, _ = f.Read(b)
 	execID := "e" + time.Now().Format("20060102150405") + randSuffix()
 	rdb.Set(c, cluster.FileTmpPrefix+execID, base64.StdEncoding.EncodeToString(b), 5*time.Minute)
-	msg, _ := marshalJSON(cluster.CtrlMessage{Action: "putfile", Cmd: path, ExecID: execID})
-	rdb.Publish(c, cluster.CtrlChannelPre+c.Param("id"), msg)
+	publishCtrl(c, c.Param("id"), cluster.CtrlMessage{Action: "putfile", Cmd: path, ExecID: execID})
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if v, err := rdb.Get(c, cluster.ExecResultPrefix+execID).Result(); err == nil {
@@ -938,8 +969,7 @@ func handleNodeExec(c *gin.Context) {
 		req.Timeout = 120
 	}
 	execID := "e" + time.Now().Format("20060102150405") + randSuffix()
-	msg, _ := marshalJSON(cluster.CtrlMessage{Action: "exec", Cmd: req.Cmd, ExecID: execID, Timeout: req.Timeout})
-	rdb.Publish(c, cluster.CtrlChannelPre+c.Param("id"), msg)
+	publishCtrl(c, c.Param("id"), cluster.CtrlMessage{Action: "exec", Cmd: req.Cmd, ExecID: execID, Timeout: req.Timeout})
 	// 轮询回执(最长等 cmd超时+10s)
 	deadline := time.Now().Add(time.Duration(req.Timeout+10) * time.Second)
 	for time.Now().Before(deadline) {
@@ -956,8 +986,7 @@ func handleNodeExec(c *gin.Context) {
 // handleNodeDelete 删除节点: 在线则先下发shutdown, 再清Redis心跳+PG行
 func handleNodeDelete(c *gin.Context) {
 	id := c.Param("id")
-	msg, _ := marshalJSON(cluster.CtrlMessage{Action: "shutdown"})
-	rdb.Publish(c, cluster.CtrlChannelPre+id, msg)
+	publishCtrl(c, id, cluster.CtrlMessage{Action: "shutdown"})
 	rdb.HDel(c, cluster.HashNodes, id)
 	if _, err := db.Exec(`DELETE FROM nodes WHERE id=$1`, id); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})

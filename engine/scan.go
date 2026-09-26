@@ -20,8 +20,10 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/httpx/runner"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // StageHook 分布式模式: 扫描阶段推进回调(节点用于上报进度)
@@ -369,8 +371,13 @@ func RunScan(ctx context.Context) error {
 		}
 		checkURLs = utils.RemoveDuplicateElement(checkURLs)
 		gologger.Info().Msg("开始主动指纹探测")
+		var dirDone int64
+		dirCb := func(resp runner.Result) {
+			http.DirBruteCallBack(resp)
+			ReportProgress("dirbrute", atomic.AddInt64(&dirDone, 1), int64(len(checkURLs)))
+		}
 		httpx.DirBrute(checkURLs,
-			http.DirBruteCallBack,
+			dirCb,
 			structs.GlobalConfig.HTTPProxy,
 			structs.GlobalConfig.WebThreads,
 			structs.GlobalConfig.WebTimeout)
@@ -451,8 +458,16 @@ func runDeepPhase(ctx context.Context) error {
 	gologger.Info().Msgf("阶段2(deep): 领取 %d 个URL资产, 跑目录/指纹/PoC", len(urls))
 	SetTotalTargets(int64(len(urls)))
 
+	// 批内实时进度: deep单批10-30分钟, 批间done不动看着像卡死 —
+	// 每个URL探针/目录请求完成即ReportProgress(经节点ProgressHook写progress hash,
+	// master的syncProgress把stage_cn拼进"拉取中 x/y · Web探针 d/t"给"在动"的观感)
+	var probeDone int64
+	probeCb := func(resp runner.Result) {
+		http.UrlCallBack(resp)
+		ReportProgress("webprobe", atomic.AddInt64(&probeDone, 1), int64(len(urls)))
+	}
 	// URL灌入Web探针回调(注册进GlobalURLMap, 指纹/目录/PoC都以它为输入源)
-	httpx.CallHTTPx(urls, http.UrlCallBack,
+	httpx.CallHTTPx(urls, probeCb,
 		structs.GlobalConfig.HTTPProxy,
 		structs.GlobalConfig.WebThreads,
 		structs.GlobalConfig.WebTimeout)
@@ -484,8 +499,13 @@ func runDeepPhase(ctx context.Context) error {
 		}
 		checkURLs = utils.RemoveDuplicateElement(checkURLs)
 		gologger.Info().Msg("开始主动指纹探测")
+		var dirDone int64
+		dirCb := func(resp runner.Result) {
+			http.DirBruteCallBack(resp)
+			ReportProgress("dirbrute", atomic.AddInt64(&dirDone, 1), int64(len(checkURLs)))
+		}
 		httpx.DirBrute(checkURLs,
-			http.DirBruteCallBack,
+			dirCb,
 			structs.GlobalConfig.HTTPProxy,
 			structs.GlobalConfig.WebThreads,
 			structs.GlobalConfig.WebTimeout)

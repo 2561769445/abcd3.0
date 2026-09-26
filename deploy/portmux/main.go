@@ -55,18 +55,51 @@ func handle(c net.Conn) {
 	if !ok {
 		return
 	}
-	up, err := net.Dial("tcp", route(line))
+	addr := route(line)
+	up, err := net.Dial("tcp", addr)
 	if err != nil {
 		return
 	}
 	defer up.Close()
-	if _, err := up.Write(line); err != nil { // 首行(含已读到的多余字节)原样转发
+	first := line
+	if addr == httpAddr {
+		first = injectClientIP(line, c.RemoteAddr())
+	}
+	if _, err := up.Write(first); err != nil { // 首行(含已读到的多余字节, HTTP方向已注入客户端IP头)转发
 		return
 	}
 	done := make(chan struct{}, 2)
 	go pipe(up, c, done)
 	go pipe(c, up, done)
 	<-done
+}
+
+// injectClientIP HTTP方向在请求行后注入X-Forwarded-For/X-Real-IP:
+// portmux是L4透传, 后端看到的源IP恒为回环, per-IP限速不可用(N12遗留)。
+// 注入位置在客户端自带同名头之前(HTTP语义Header.Get取首值), 客户端无法伪造排位。
+// PRI(HTTP/2明文前导)跳过 — 其后紧跟二进制SETTINGS帧, 注入文本会破坏帧协议。
+func injectClientIP(buf []byte, raddr net.Addr) []byte {
+	line := string(buf)
+	if i := indexOfCRLF(buf); i >= 0 {
+		line = line[:i]
+	}
+	if parts := strings.Fields(line); len(parts) > 0 && parts[0] == "PRI" {
+		return buf
+	}
+	ip, _, err := net.SplitHostPort(raddr.String())
+	if err != nil {
+		ip = raddr.String()
+	}
+	idx := indexOfCRLF(buf)
+	if idx < 0 {
+		return buf // sniff已保证有完整首行, 防御性兜底
+	}
+	inj := []byte("X-Forwarded-For: " + ip + "\r\nX-Real-IP: " + ip + "\r\n")
+	out := make([]byte, 0, len(buf)+len(inj))
+	out = append(out, buf[:idx+2]...)
+	out = append(out, inj...)
+	out = append(out, buf[idx+2:]...)
+	return out
 }
 
 // sniffFirstLine 循环读直到凑齐首行(见\r\n)或读满缓冲。

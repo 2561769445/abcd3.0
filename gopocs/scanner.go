@@ -8,12 +8,20 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 var Mutex = &sync.Mutex{}
 
 // 单线程的
 var currentCount = 0
+
+// gopocTargetTimeout 单目标硬顶。各插件内部已有 per-attempt 6s 超时和 len(字典)*6 逃生,
+// 但仍存在挂死场景: telnet 库读无 deadline(telnetlib SetReadDeadline 被注释)/SSH 握手后
+// session.CombinedOutput 无整体 deadline/Web 中间件爆破对不回包目标阻塞。挂死 goroutine 会
+// 让 wg.Wait() 永不返回 → 整个子进程假死(27.149 卡92%两小时零日志事故)。
+// watchdog 超时后放弃该目标并释放并发槽, 整批继续; 挂死的插件 goroutine 泄漏(可接受)。
+const gopocTargetTimeout = 10 * time.Minute
 
 func AddScan(scantype string, info structs.HostInfo, ch *chan struct{}, wg *sync.WaitGroup) {
 	currentCount += 1
@@ -24,15 +32,29 @@ func AddScan(scantype string, info structs.HostInfo, ch *chan struct{}, wg *sync
 	*ch <- struct{}{}
 	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		defer func() { <-*ch }() // 槽位释放必须在watchdog收口: 不能等可能挂死的插件goroutine
 		Mutex.Lock()
 		structs.AddScanNum += 1
 		Mutex.Unlock()
-		ScanFunc(&scantype, &info)
+
+		target := info.Host + ":" + info.Ports
+		if info.Url != "" {
+			target = info.Url
+		}
+		done := make(chan struct{}, 1)
+		go func() {
+			ScanFunc(&scantype, &info)
+			done <- struct{}{}
+		}()
+		select {
+		case <-done:
+		case <-time.After(gopocTargetTimeout):
+			gologger.Error().Msgf("[GoPoc] 单目标超时放弃(%v): %v %v — 插件挂死(疑似读无deadline), 释放槽位整批继续", gopocTargetTimeout, scantype, target)
+		}
 		Mutex.Lock()
 		structs.AddScanEnd += 1
 		Mutex.Unlock()
-		wg.Done()
-		<-*ch
 	}()
 }
 

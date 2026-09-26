@@ -319,7 +319,9 @@ func (c *Client) MakeReply(command []byte) []byte {
 func (c *Client) read() ([]byte, error) {
 	var buf [2048]byte
 	var n int
-	//_ = c.conn.SetReadDeadline(time.Now().Add(time.Second * 3))
+	// 读deadline必须保留(原注释掉=对端不发包时conn.Read永久阻塞, Telnet爆破挂死根因;
+	// 6s与gopocs其余插件per-attempt超时口径一致, 正常telnet交互毫秒级回显不受影响)
+	_ = c.conn.SetReadDeadline(time.Now().Add(time.Second * 6))
 	n, err := c.conn.Read(buf[0:])
 	if err != nil {
 		return nil, err

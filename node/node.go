@@ -30,8 +30,9 @@ type nodeOptions struct {
 	redisDB     int
 	nodeName    string
 	nodeID      string
-	maxTasks    int // 预留: 当前版本串行=1
-	pollTimeout int // 领任务阻塞秒数
+	maxTasks    int    // 预留: 当前版本串行=1
+	pollTimeout int    // 领任务阻塞秒数
+	ctrlSecret  string // 控制指令HMAC验签密钥(ABCD_CTRL_SECRET, 空=明文兼容)
 }
 
 var (
@@ -47,6 +48,24 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// isSelfKillCmd 判定命令是否会杀掉本节点进程自身(exec通道宿主):
+// 直接执行会连坐终止exec goroutine — 回执丢失、命令链后半截不跑。
+func isSelfKillCmd(cmd string) bool {
+	for _, pat := range []string{
+		"systemctl restart abcd-node",
+		"systemctl stop abcd-node",
+		"systemctl disable abcd-node",
+		"pkill abcd-node",
+		"pkill -f abcd-node",
+		"killall abcd-node",
+	} {
+		if strings.Contains(cmd, pat) {
+			return true
+		}
+	}
+	return false
+}
+
 // Run -node 模式入口
 func Run() {
 	fs := flag.NewFlagSet("abcd-node", flag.ExitOnError)
@@ -56,6 +75,7 @@ func Run() {
 	fs.StringVar(&opt.nodeName, "n", "", "节点名称(默认主机名)")
 	fs.IntVar(&opt.pollTimeout, "poll", 5, "领任务阻塞超时(秒)")
 	_ = fs.Parse(os.Args[2:])
+	opt.ctrlSecret = os.Getenv("ABCD_CTRL_SECRET") // service Environment注入; 空=明文兼容旧master
 
 	if opt.nodeName == "" {
 		h, _ := os.Hostname()
@@ -143,6 +163,12 @@ func ctrlLoop(ctx context.Context, cancel context.CancelFunc) {
 			if err := json.Unmarshal([]byte(msg.Payload), &cm); err != nil {
 				continue
 			}
+			// 指令验签(N13纵深防御): ABCD_CTRL_SECRET非空时强制HMAC校验 —
+			// 能连Redis≠能指挥节点执行命令; secret空=明文兼容(旧master/未配置)
+			if !cluster.VerifyCtrlSig(opt.ctrlSecret, &cm) {
+				gologger.Error().Msgf("控制指令验签失败, 丢弃: action=%s execID=%s(伪造或master与节点ABCD_CTRL_SECRET不一致)", cm.Action, cm.ExecID)
+				continue
+			}
 			switch cm.Action {
 			case "exec":
 				// 远程命令执行(主控Web终端): 带session维持工作目录(cd持久)
@@ -161,8 +187,19 @@ func ctrlLoop(ctx context.Context, cancel context.CancelFunc) {
 						}
 						cmdStr = "cd " + shQuote(wd) + " 2>/dev/null; " + cm.Cmd + "; echo __CWD__:$(pwd)"
 					}
+					// 自杀保护: 命令含重启/停止/杀本节点服务时直接执行会连坐杀掉exec宿主
+					// (回执丢失+命令链后半截不跑), 转systemd-run延迟3秒脱离本服务cgroup执行。
+					// nohup形态的升级命令自带脱挂设计(v48), 不再重复包装。
+					selfGuarded := false
+					if isSelfKillCmd(cmdStr) && !strings.Contains(cmdStr, "nohup") {
+						selfGuarded = true
+						cmdStr = "systemd-run --on-active=3s --collect /bin/bash -c " + shQuote(cmdStr)
+					}
 					out, err := exec.CommandContext(ectx, "/bin/bash", "-c", cmdStr).CombinedOutput()
 					result := string(out)
+					if selfGuarded {
+						result = "[self-kill guarded] 命令含重启/停止本节点, 已转systemd-run 3秒后脱离cgroup执行(结果不回传本通道, 稍后看服务状态):\n" + result
+					}
 					if cm.Session != "" {
 						if i := strings.LastIndex(result, "__CWD__:"); i >= 0 {
 							wd := strings.TrimSpace(result[i+len("__CWD__:"):])
