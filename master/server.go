@@ -873,6 +873,10 @@ func nodeCtrlRound(c *gin.Context, action, path string, wait time.Duration) stri
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if v, err := rdb.Get(c, cluster.ExecResultPrefix+execID).Result(); err == nil {
+			if v == "__PENDING__" { // v73节点送达占位: 继续等真实结果
+				time.Sleep(400 * time.Millisecond)
+				continue
+			}
 			rdb.Del(c, cluster.ExecResultPrefix+execID)
 			return v
 		}
@@ -906,6 +910,10 @@ func handleNodeFileUpload(c *gin.Context) {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if v, err := rdb.Get(c, cluster.ExecResultPrefix+execID).Result(); err == nil {
+			if v == "__PENDING__" { // v73节点送达占位: 继续等真实结果
+				time.Sleep(400 * time.Millisecond)
+				continue
+			}
 			rdb.Del(c, cluster.ExecResultPrefix+execID)
 			if strings.HasPrefix(v, "OK") {
 				c.JSON(200, gin.H{"output": v})
@@ -970,17 +978,29 @@ func handleNodeExec(c *gin.Context) {
 	}
 	execID := "e" + time.Now().Format("20060102150405") + randSuffix()
 	publishCtrl(c, c.Param("id"), cluster.CtrlMessage{Action: "exec", Cmd: req.Cmd, ExecID: execID, Timeout: req.Timeout})
-	// 轮询回执(最长等 cmd超时+10s)
+	// 轮询回执(最长等 cmd超时+10s)。
+	// __PENDING__=节点已送达占位(v73): 继续等, 不DEL占位; 到期仍PENDING则报"已接收未完成"
+	// 与"指令没送达"(节点离线/pubsub断连)区分 — 治182假504的"到底收没收到"盲区。
 	deadline := time.Now().Add(time.Duration(req.Timeout+10) * time.Second)
+	received := false
 	for time.Now().Before(deadline) {
 		if v, err := rdb.Get(c, cluster.ExecResultPrefix+execID).Result(); err == nil {
+			if v == "__PENDING__" {
+				received = true
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
 			rdb.Del(c, cluster.ExecResultPrefix+execID)
-			c.JSON(200, gin.H{"output": v})
+			c.JSON(200, gin.H{"output": v, "received": true})
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	c.JSON(504, gin.H{"error": "节点执行超时/无响应(节点离线或旧版本不支持)"})
+	if received {
+		c.JSON(504, gin.H{"error": "节点已接收指令但未在超时内完成(命令执行慢或卡住), 结果稍后可能写入但不再等待", "received": true})
+	} else {
+		c.JSON(504, gin.H{"error": "节点未响应(节点离线或pubsub断连, 指令未送达)", "received": false})
+	}
 }
 
 // handleNodeDelete 删除节点: 在线则先下发shutdown, 再清Redis心跳+PG行

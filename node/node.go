@@ -92,6 +92,9 @@ func Run() {
 		Addr:     opt.redisAddr,
 		Password: opt.redisPass,
 		DB:       opt.redisDB,
+		// 默认3s读超时扛不住大value(文件中转的base64几十MB经portmux慢路径GET必超时,
+		// 表现=文件功能"ERR no content"), 调30s; 写超时/重试保持默认
+		ReadTimeout: 30 * time.Second,
 	})
 	if err := rdb.Ping(nodeCtx).Err(); err != nil {
 		gologger.Fatal().Msgf("连接Redis失败 %s: %v", opt.redisAddr, err)
@@ -168,6 +171,13 @@ func ctrlLoop(ctx context.Context, cancel context.CancelFunc) {
 			if !cluster.VerifyCtrlSig(opt.ctrlSecret, &cm) {
 				gologger.Error().Msgf("控制指令验签失败, 丢弃: action=%s execID=%s(伪造或master与节点ABCD_CTRL_SECRET不一致)", cm.Action, cm.ExecID)
 				continue
+			}
+			// 送达回执: 带ExecID的指令立即占位(执行完覆盖) — master可区分
+			// "指令没送达"(节点离线/pubsub断连, 182的假504) vs "已接收但执行慢"
+			if cm.ExecID != "" {
+				pctx, pc := context.WithTimeout(context.Background(), 3*time.Second)
+				rdb.Set(pctx, cluster.ExecResultPrefix+cm.ExecID, "__PENDING__", 10*time.Minute)
+				pc()
 			}
 			switch cm.Action {
 			case "exec":

@@ -23,3 +23,9 @@ deploy/kill_java.sh
 # 3.0发布补漏(含凭据运维脚本)
 deploy/deploy_*.py
 deploy/upgrade_*.py
+
+# v65测试残留
+deploy/kill_test_state.json
+deploy/running_before_v65d.txt
+deploy/test2_targets.json
+deploy/watch_pull_v65.py
