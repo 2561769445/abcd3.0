@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABCD · 分布式资产测绘与漏洞扫描平台</title>
+<style>
+:root{--bg:#0D1526;--p1:#4ecdc4;--p2:#2292a0;--p3:#7fe8dd;--txt:#d7e0ea;--dim:#8194a7;--acc:#4ecdc4}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--txt);font:16px/1.8 "Microsoft YaHei",-apple-system,sans-serif;overflow-x:hidden}
+.stars{position:fixed;inset:0;pointer-events:none;z-index:0}
+.star{position:absolute;background:#fff;border-radius:50%;animation:tw 3s infinite}
+@keyframes tw{0%,100%{opacity:.12}50%{opacity:.8}}
+.hero{min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:20px;position:relative;z-index:1}
+/* 雷达 */
+.radar{width:210px;height:210px;border-radius:50%;border:1px solid #1f4a52;position:relative;box-shadow:0 0 60px #2292a044;animation:float 5s ease-in-out infinite}
+.radar::before,.radar::after{content:"";position:absolute;background:#1f4a52;border-radius:50%}
+.radar::before{inset:32px}.radar::after{inset:70px}
+.sweep{position:absolute;inset:0;border-radius:50%;overflow:hidden}
+.sweep i{position:absolute;left:50%;top:50%;width:50%;height:2px;transform-origin:left center;
+background:linear-gradient(90deg,transparent,var(--acc));animation:spin 3.2s linear infinite}
+.sweep i::after{content:"";position:absolute;inset:0 0 0 0;background:conic-gradient(from 0deg,transparent 0deg,#4ecdc422 25deg,transparent 26deg);border-radius:0 100% 100% 0 / 0 50% 50% 0;width:200%;height:200%;top:-50%;left:0;transform-origin:center}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-14px)}}
+.blip{position:absolute;width:7px;height:7px;border-radius:50%;background:var(--acc);animation:blip 3.2s infinite}
+@keyframes blip{0%,20%{opacity:0;box-shadow:0 0 0 0 #4ecdc4}30%{opacity:1;box-shadow:0 0 12px 2px #4ecdc4aa}80%{opacity:.6}100%{opacity:0}}
+.hero h1{font-size:56px;margin:30px 0 6px;font-weight:900;letter-spacing:6px;color:#fff}
+.hero h1 span{background:linear-gradient(90deg,var(--p3),var(--p1));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p.tag{color:var(--dim);font-size:17px}
+.typing{color:var(--p3);font-size:15px;min-height:28px;font-family:Consolas,monospace;margin-top:10px}
+.caret{display:inline-block;width:8px;height:16px;background:var(--p3);vertical-align:-2px;animation:tw 1s infinite}
+.btns{margin-top:30px;display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+.btn{padding:13px 32px;border-radius:10px;font-size:16px;text-decoration:none;font-weight:600;transition:.25s}
+.btn.p{background:linear-gradient(135deg,var(--p1),var(--p2));color:#04262a;box-shadow:0 8px 24px #2292a055}
+.btn.p:hover{transform:translateY(-3px)}
+.btn.g{border:1px solid #283548;color:var(--dim)}.btn.g:hover{border-color:var(--acc);color:var(--acc)}
+.stats{display:flex;gap:40px;justify-content:center;margin-top:52px;flex-wrap:wrap}
+.stat b{font-size:38px;background:linear-gradient(90deg,var(--p3),var(--p1));-webkit-background-clip:text;background-clip:text;color:transparent;display:block}
+.stat span{color:var(--dim);font-size:13px}
+section{max-width:1080px;margin:0 auto;padding:84px 24px;position:relative;z-index:1}
+h2{font-size:30px;text-align:center;margin-bottom:12px}
+h2 em{font-style:normal;background:linear-gradient(90deg,var(--p3),var(--p1));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{text-align:center;color:var(--dim);margin-bottom:46px}
+/* master-node 拓扑 */
+.topo{height:400px;position:relative;display:flex;justify-content:center;align-items:center}
+.master{width:96px;height:96px;border-radius:22px;background:linear-gradient(135deg,var(--p1),var(--p2));display:flex;align-items:center;justify-content:center;font-weight:800;color:#04262a;font-size:15px;z-index:2;box-shadow:0 0 44px #4ecdc455;animation:pulseM 2.4s infinite}
+@keyframes pulseM{50%{box-shadow:0 0 66px #4ecdc4aa}}
+.node{position:absolute;width:64px;height:64px;border-radius:16px;background:#12262e;border:1px solid #2b5a63;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--p3);animation:float 4s ease-in-out infinite}
+.node small{display:block;font-size:10px;color:var(--dim)}
+.node::after{content:"";position:absolute;inset:-1px;border-radius:16px;border:1px solid var(--acc);opacity:0;animation:ripple 2.8s infinite}
+@keyframes ripple{0%{transform:scale(1);opacity:.7}100%{transform:scale(1.55);opacity:0}}
+.link{position:absolute;height:1px;background:linear-gradient(90deg,#2b5a63,#4ecdc466);transform-origin:left center}
+.spark{position:absolute;width:6px;height:6px;border-radius:50%;background:var(--acc);box-shadow:0 0 8px var(--acc);animation:travel 2.6s linear infinite}
+@keyframes travel{0%{left:0;opacity:0}12%{opacity:1}88%{opacity:1}100%{left:100%;opacity:0}}
+/* 流程 */
+.flow{display:flex;justify-content:center;align-items:stretch;flex-wrap:wrap}
+.step{background:#141d2e;border:1px solid #283548;border-radius:14px;padding:22px 16px;width:158px;text-align:center;opacity:0;transform:translateY(28px);transition:.7s}
+.step.on{opacity:1;transform:none}
+.step .ico{font-size:32px;margin-bottom:6px}
+.step b{display:block;font-size:15px;margin-bottom:4px}
+.step small{color:var(--dim);font-size:12px;display:block}
+.arrow{align-self:center;color:var(--p3);font-size:22px;padding:0 8px;animation:slide 1.6s infinite}
+@keyframes slide{50%{transform:translateX(6px)}}
+.feats{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.feat{background:#141d2e;border:1px solid #283548;border-radius:14px;padding:24px;opacity:0;transform:translateY(26px);transition:.7s}
+.feat.on{opacity:1;transform:none}.feat:hover{border-color:var(--acc)}
+.feat b{font-size:16px}.feat p{color:var(--dim);font-size:13.5px;margin-top:6px}
+.feat .i{font-size:26px;margin-bottom:8px;display:block}
+.gh-box{text-align:center;background:#141d2e;border:1px dashed #3a4a63;border-radius:16px;padding:44px 24px}
+.gh-box code{display:inline-block;margin-top:14px;padding:10px 22px;background:#0e1523;border-radius:8px;color:var(--p3);font-size:15px;font-family:Consolas,monospace;user-select:all}
+footer{text-align:center;color:#56657a;font-size:13px;padding:36px 0 56px;position:relative;z-index:1}
+.reveal{opacity:0;transform:translateY(30px);transition:.8s}
+.reveal.on{opacity:1;transform:none}
+@media(max-width:760px){.hero h1{font-size:36px}.topo{height:300px}}
+</style>
+</head>
+<body>
+<div class="stars" id="stars"></div>
+
+<div class="hero">
+  <div class="radar"><div class="sweep"><i></i></div>
+    <div class="blip" style="top:38px;left:130px"></div>
+    <div class="blip" style="top:90px;left:52px;animation-delay:1.2s"></div>
+    <div class="blip" style="top:150px;left:150px;animation-delay:2.1s"></div>
+  </div>
+  <h1>AB<span>D</span></h1>
+  <p class="tag">分布式资产测绘与漏洞扫描平台 · Master + 多节点</p>
+  <div class="typing"><span id="ty"></span><i class="caret"></i></div>
+  <div class="btns">
+    <a class="btn p" href="https://github.com/2561769445/abcd3.0" target="_blank">⬇ GitHub 获取</a>
+    <a class="btn g" href="https://github.com/2561769445/abcd3.0" target="_blank">📖 使用文档</a>
+  </div>
+  <div class="stats">
+    <div class="stat"><b data-n="7" data-suf="+">0</b><span>扫描节点弹性扩展</span></div>
+    <div class="stat"><b data-n="4">0</b><span>测绘引擎(Fofa/Hunter/Quake/Bing)</span></div>
+    <div class="stat"><b data-n="0" data-suf="×丢任务">0</b><span>断链重订阅队列</span></div>
+    <div class="stat"><b data-n="2">0</b><span>层扫描(测绘+漏扫)</span></div>
+  </div>
+</div>
+
+<section>
+  <h2>Master 调度 · <em>节点群狼</em></h2>
+  <p class="lead">pull 拉模式任务分发 · HMAC 指令验签 · 断链自动重订阅 · 节点远程命令控制</p>
+  <div class="topo" id="topo">
+    <div class="master">MASTER</div>
+  </div>
+</section>
+
+<section>
+  <h2>从资产到漏洞 · <em>一条流水线</em></h2>
+  <div class="flow">
+    <div class="step"><div class="ico">🎯</div><b>资产输入</b><small>域名/IP段清单<br>多任务并发</small></div>
+    <div class="arrow">➜</div>
+    <div class="step"><div class="ico">🛰️</div><b>资产测绘</b><small>Fofa/Hunter/Quake<br>四引擎并行</small></div>
+    <div class="arrow">➜</div>
+    <div class="step"><div class="ico">⚡</div><b>存活+漏扫</b><small>节点均分任务<br>GoPoc watchdog</small></div>
+    <div class="arrow">➜</div>
+    <div class="step"><div class="ico">🧹</div><b>聚合筛选</b><small>结果去重聚合<br>漏洞勾选管理</small></div>
+    <div class="arrow">➜</div>
+    <div class="step"><div class="ico">📄</div><b>HTML报告</b><small>左右分栏数据包<br>dddd 风格</small></div>
+  </div>
+</section>
+
+<section>
+  <h2>为<em>实战</em>而生的细节</h2>
+  <div class="feats">
+    <div class="feat"><span class="i">🔐</span><b>指令 HMAC 验签</b><p>伪造的节点指令实测被拒并留日志 —— 防指令注入</p></div>
+    <div class="feat"><span class="i">🔁</span><b>断链重订阅</b><p>心跳在线但 exec 卡死？订阅断链自动恢复，零丢任务</p></div>
+    <div class="feat"><span class="i">🐌</span><b>大文件读超时</b><p>Redis 读超时 + telnet deadline 治理挂死根因</p></div>
+    <div class="feat"><span class="i">🧯</span><b>自杀保护</b><p>deep 批内 live/exec 防误杀自身节点</p></div>
+    <div class="feat"><span class="i">🛡️</span><b>per-IP 登录限速</b><p>portmux XFF 注入防护 · master 可见真实公网 IP</p></div>
+    <div class="feat"><span class="i">📡</span><b>不选节点=全员均分</b><p>多任务并发子进程隔离 · 送达回执区分未达/慢执行</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>开源地址</h2>
+  <div class="gh-box reveal">
+    <div style="font-size:40px">🛰️</div>
+    <p style="margin-top:10px">一键部署 · 节点 SSH 免密推送<br>分布式测绘 × 漏洞扫描 × 聚合报告</p>
+    <code>github.com/2561769445/abcd3.0</code>
+    <p style="color:#56657a;font-size:13px;margin-top:16px">仅供授权安全测试</p>
+  </div>
+</section>
+
+<footer><p>ABCD 分布式扫描平台 v74+</p></footer>
+
+<script>
+const sk=document.getElementById('stars');
+for(let i=0;i<80;i++){const s=document.createElement('i');s.className='star';
+s.style.cssText=`left:${Math.random()*100}vw;top:${Math.random()*100}vh;width:${Math.random()*2+1}px;height:${Math.random()*2+1}px;animation-delay:${Math.random()*3}s`;
+sk.appendChild(s)}
+const msgs=['Master + 多节点 · pull拉模式 · 任务零丢失','Fofa / Hunter / Quake / Bing 四引擎测绘','HMAC指令验签 · 断链重订阅 · 自杀保护','聚合筛选 → 勾选导出 → dddd风HTML报告'];
+let mi=0,ci=0,del=false;
+(function type(){const m=msgs[mi];document.getElementById('ty').textContent=del?m.slice(0,--ci):m.slice(0,++ci);
+if(!del&&ci===m.length){del=true;setTimeout(type,2000);return}
+if(del&&ci===0){del=false;mi=(mi+1)%msgs.length}
+setTimeout(type,del?22:55)})();
+// 动态拓扑: 6节点环绕master + 连线 + 流动光点
+const topo=document.getElementById('topo');
+const CX=50,CY=50,R=36; // percent
+const nodes=[['节点96','华东'],['节点182','云端'],['华为云A','cluster'],['华为云B','cluster'],['节点130','海外'],['新节点','即插即用']];
+nodes.forEach((n,i)=>{
+  const ang=(i/nodes.length)*Math.PI*2-Math.PI/2;
+  const x=CX+R*Math.cos(ang),y=CY+R*Math.sin(ang);
+  const node=document.createElement('div');node.className='node';
+  node.style.cssText=`left:${x}%;top:${y}%;transform:translate(-50%,-50%);animation-delay:${i*.4}s`;
+  node.innerHTML=`${n[0]}<small>${n[1]}</small>`;topo.appendChild(node);
+  // 连线(从中心到节点): 用全尺寸svg更准 — 简化: 一个绝对定位旋转线
+  const dx=(x-CX),dy=(y-CY),len=Math.hypot(dx,dy);
+  const deg=Math.atan2(dy,dx)*180/Math.PI;
+  const link=document.createElement('div');link.className='link';
+  link.style.cssText=`left:${CX}%;top:${CY}%;width:${len}%;transform:rotate(${deg}deg)`;
+  topo.appendChild(link);
+  const sp=document.createElement('div');sp.className='spark';
+  sp.style.cssText=`left:${CX}%;top:${CY}%;transform:rotate(${deg}deg) translateY(-3px);width:${len}%;height:6px;animation-delay:${i*.45}s`;
+  // spark需要沿旋转线移动: 用嵌套方式
+  sp.innerHTML='';
+  const wrap=document.createElement('div');
+  wrap.style.cssText=`position:absolute;left:${CX}%;top:${CY}%;width:${len}%;height:0;transform:rotate(${deg}deg)`;
+  const dot=document.createElement('i');
+  dot.style.cssText=`position:absolute;top:-3px;left:0;width:6px;height:6px;border-radius:50%;background:#4ecdc4;box-shadow:0 0 8px #4ecdc4;animation:travel 2.6s linear infinite;animation-delay:${i*.45}s`;
+  wrap.appendChild(dot);topo.appendChild(wrap);
+});
+const io=new IntersectionObserver(es=>es.forEach(e=>{if(!e.isIntersecting)return;
+if(e.target.classList.contains('stat')){const b=e.target.querySelector('b');const n=+b.dataset.n,suf=b.dataset.suf||'';let t0=null;
+const tick=ts=>{t0??=ts;const p=Math.min((ts-t0)/1200,1);b.textContent=Math.round(n*(1-Math.pow(1-p,3)))+suf;if(p<1)requestAnimationFrame(tick)};requestAnimationFrame(tick)}
+e.target.classList.add('on')}));
+document.querySelectorAll('.step,.feat,.reveal,.stat').forEach((el,i)=>{el.style.transitionDelay=(i%8*70)+'ms';io.observe(el)});
+</script>
+</body>
+</html>
